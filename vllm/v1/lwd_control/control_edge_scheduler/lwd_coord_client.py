@@ -10,7 +10,13 @@ a wave. The edge -- the cloud's front-end stand-in -- sends FIRST_REQ
 be paused; wave 0 is a safe stale value, the coordinator turns a stale
 wave into a broadcast to every engine. Stats coming back are logged for
 reconciliation only: routing decisions use the local per-DP accounts.
-"""
+
+The wire payload is ``(engine_index, wave)``, not the full
+``LwdConnectionId``: the native coordinator only excludes the engine that
+received the request. Several edges may wake the same cloud DP through their
+own clients; all of them name the same engine index, which is the intended
+identity for this protocol.
+"""  # 【MR2】协议载荷只用 (engine_index, wave)：协调器只排除收到请求的引擎，多条边可唤醒同一云 DP，引擎索引就是协议身份
 
 from __future__ import annotations
 

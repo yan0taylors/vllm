@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from enum import Enum, auto
 from typing import Any
 
+from vllm.lwd_logger import lwd_logger  # 【MR2】引入 LWD 统一日志器（下面记录完成快照失败用）
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
@@ -169,6 +170,35 @@ class LwdBaseScheduler(AsyncScheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Record the finish snapshot and release prefix/refill state.
+
+        Normal termination (check_stop in update_from_output) calls
+        ``self._free_request(request)`` directly, aborts/errors arrive via
+        ``finish_requests``; both converge here, so the snapshot must be
+        taken in this single choke point (finish_requests would miss most
+        normal endings). The engine consumes ``lwd_finished_records``
+        (removing entries as it publishes usage); without this snapshot the
+        ledger stays empty and usage events are never published.
+        """
+        try:  # 【MR2】在统一的请求释放入口记录完成快照：正常结束直接调用这里，abort/error 经 finish_requests 也会汇合到此处
+            records = self.lwd_finished_records  # 【MR2】读取云端完成记录表；边侧调度器没有该表，靠下面的 AttributeError 兜底
+            records[request.request_id] = (  # 【MR2】记录 prompt 长度和已生成 token 数，供引擎发布 usage 事件
+                request.num_prompt_tokens,
+                request.num_tokens - request.num_prompt_tokens,
+            )
+            if len(records) > 1024:  # 【MR2】表超过 1024 条就淘汰最旧的 256 条，避免长期运行无限增长
+                for stale in list(records)[:256]:
+                    records.pop(stale, None)
+                lwd_logger.warning(
+                    "[Lwd][coord] finished-record table full; evicted oldest"
+                )
+        except AttributeError:  # 【MR2】边侧调度器没有 lwd_finished_records，忽略即可
+            # Edge schedulers keep no finished-record ledger.
+            pass
+        except Exception:  # noqa: BLE001  snapshot failure must not block release  # 【MR2】快照失败不能阻塞请求释放，只记录告警
+            lwd_logger.warning(  # 【MR2】非致命异常只打日志，不向上抛
+                "[Lwd][coord] finished snapshot failed (non-fatal)", exc_info=True
+            )
         reservations = getattr(self, "lwd_prefix_reservations", None)
         if reservations is not None:
             reservations.release(request.request_id)
