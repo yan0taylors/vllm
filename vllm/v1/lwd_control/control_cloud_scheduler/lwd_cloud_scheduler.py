@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
+from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import (
     LwdBatch,
@@ -45,9 +46,11 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.outputs import ModelRunnerOutput
 
-LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
-"""Finished ModelRunnerOutput.lwd_down_carrier harvested by the executor
-output thread."""
+LwdDownCarrier = (
+    tuple[torch.Tensor, list[str], int, int]
+    | tuple[torch.Tensor, list[str], int, int, LwdConnectionId]
+)
+"""Harvested DOWN metadata; the fifth item is mandatory outside implicit 1E1C."""
 
 
 @dataclass
@@ -59,6 +62,7 @@ class LwdC2eMeta:
     num_accepted_tokens: list[int]
     req_ids: list[str]
     down_seqno: int
+    connection_id: LwdConnectionId = LwdConnectionId(0, 0, 0)
 
 
 @dataclass(frozen=True)
@@ -452,6 +456,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 down_seqno=meta.down_seqno,
                 token_ids=token_ids,
                 prefix_nonces=self._lwd_c2e_prefix_nonces(meta.req_ids, nonce_snapshot),
+                edge_id=meta.connection_id.edge_id,
+                cloud_id=meta.connection_id.cloud_id,
+                dp_idx=meta.connection_id.dp_idx,
             )
         )
 
@@ -479,9 +486,34 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         )
 
-    @staticmethod
-    def _lwd_carrier_to_meta(carrier: LwdDownCarrier) -> LwdC2eMeta:
-        packed, request_ids, hidden_numel, seqno = carrier
+    def _lwd_carrier_connection_id(self, carrier: LwdDownCarrier) -> LwdConnectionId:
+        lwd_config = getattr(self.vllm_config, "lwd_config", None)
+        topology_ids = (
+            {connection.connection_id for connection in lwd_config.connections}
+            if lwd_config is not None
+            else set()
+        )
+        if len(carrier) == 4:
+            default = LwdConnectionId(0, 0, 0)
+            if topology_ids and topology_ids != {default}:
+                raise ValueError(
+                    "[LWD] DOWN carrier is missing LwdConnectionId outside 1E1C"
+                )
+            return default
+        connection_id = carrier[4]
+        if not isinstance(connection_id, LwdConnectionId):
+            raise TypeError(
+                "[LWD] DOWN carrier connection stamp is not LwdConnectionId"
+            )
+        if topology_ids and connection_id not in topology_ids:
+            raise ValueError(
+                f"[LWD] DOWN carrier names unknown connection {connection_id}"
+            )
+        return connection_id
+
+    def _lwd_carrier_to_meta(self, carrier: LwdDownCarrier) -> LwdC2eMeta:
+        connection_id = self._lwd_carrier_connection_id(carrier)
+        packed, request_ids, hidden_numel, seqno = carrier[:4]
         num_requests = len(request_ids)
         values = packed.tolist()
         counts = values[-2 * num_requests : -num_requests]
@@ -498,6 +530,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             num_accepted_tokens=list(counts),
             req_ids=list(request_ids),
             down_seqno=seqno,
+            connection_id=connection_id,
         )
 
     @staticmethod

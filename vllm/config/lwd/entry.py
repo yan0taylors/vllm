@@ -50,6 +50,8 @@ class LwdConfig:
         instance = topology.instance(role, identity)
         if instance.coordination is not None:
             coord_dict = asdict(instance.coordination)
+            if coord_dict["instance_id"] is None:
+                del coord_dict["instance_id"]
             coordination = LwdCoordinationConfig.from_dict(
                 coord_dict,
                 cloud_id=identity if role == "cloud" else None,

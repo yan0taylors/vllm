@@ -21,6 +21,7 @@ import time
 from collections import deque
 from typing import Any
 
+from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
@@ -83,13 +84,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             if self._lwd_prefix_enabled
             else None
         )
-        self._lwd_cloud_params: dict[int, LwdCloudParamsNotify] = {}
+        self._lwd_cloud_params: dict[LwdConnectionId, LwdCloudParamsNotify] = {}
         self._lwd_cloud_params_received = threading.Event()
         plane = self._lwd_start_control_plane()
         assert isinstance(plane, LwdEdgeControlPlane)
         handshake_timeout_s = plane.spec.config.handshake_timeout_s
         deadline = time.monotonic() + handshake_timeout_s
-        self._lwd_clouds: dict[int, LwdPeer] = plane.wait_until_ready(
+        self._lwd_clouds: dict[LwdConnectionId, LwdPeer] = plane.wait_until_ready(
             handshake_timeout_s
         )
         expected = len(self._lwd_clouds)
@@ -105,12 +106,14 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     f"{handshake_timeout_s}s"
                 )
             self._lwd_cloud_params_received.clear()
-        for dp_idx, params in self._lwd_cloud_params.items():
-            self._lwd_check_cloud_params(dp_idx, params)
+        for connection_id, params in self._lwd_cloud_params.items():
+            self._lwd_check_cloud_params(connection_id, params)
         self._lwd_configure_prefix_cache()
-        self._lwd_coord_clients: dict[int, LwdCoordClient] = {
-            dp_idx: LwdCoordClient(dp_idx, params.dp_coordinator_addr)
-            for dp_idx, params in self._lwd_cloud_params.items()
+        self._lwd_coord_clients: dict[LwdConnectionId, LwdCoordClient] = {
+            connection_id: LwdCoordClient(
+                connection_id.dp_idx, params.dp_coordinator_addr
+            )
+            for connection_id, params in self._lwd_cloud_params.items()
             if params.dp_coordinator_addr
         }
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
@@ -129,10 +132,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
     def _lwd_configure_prefix_cache(self) -> None:
         capabilities: set[tuple[int, int, bool, bool]] = set()
-        for dp_idx, params in self._lwd_cloud_params.items():
+        for connection_id, params in self._lwd_cloud_params.items():
             if self._lwd_prefix_enabled != params.prefix_caching:
                 raise RuntimeError(
-                    f"[LWD] prefix caching mismatch on dp{dp_idx}: "
+                    f"[LWD] prefix caching mismatch on dp{connection_id}: "
                     f"edge={self._lwd_prefix_enabled} "
                     f"cloud={params.prefix_caching}"
                 )
@@ -170,8 +173,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
         """Cloud limits -> record and wake the startup wait; c2e -> scheduler
         notify queue + WAKEUP; anything else is unknown."""
+        connection_id = self._lwd_connection_of(peer)
         if isinstance(msg, LwdCloudParamsNotify):
-            self._lwd_cloud_params[peer.dp_rank] = msg
+            self._lwd_cloud_params[connection_id] = msg
             self._lwd_cloud_params_received.set()
             return True
         if isinstance(msg, (LwdPrefixReadyNotify, LwdRefillNotify)):
@@ -179,18 +183,18 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return True
         if isinstance(msg, LwdC2eNotify):
             lwd_logger.info(
-                "[edge] c2e received from dp%d reqs=%d hidden_numel=%d",
-                peer.dp_rank,
+                "[edge] c2e received from %s reqs=%d hidden_numel=%d",
+                connection_id,
                 len(msg.req_ids),
                 msg.hidden_num_elements,
             )
-            self.scheduler.unembed_notify_queue.append((peer.dp_rank, msg))
+            self.scheduler.unembed_notify_queue.append((connection_id, msg))
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             return True
         return False
 
     def _lwd_check_cloud_params(
-        self, dp_idx: int, params: LwdCloudParamsNotify
+        self, connection_id: LwdConnectionId, params: LwdCloudParamsNotify
     ) -> None:
         """(max_num_batched_tokens, max_num_seqs) must match every cloud DP
         rank: a mismatch makes the cloud hold prefills behind decodes forever
@@ -200,23 +204,25 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         remote = (params.max_num_batched_tokens, params.max_num_seqs)
         if local != remote:
             raise RuntimeError(
-                f"[LWD] edge/cloud scheduling config mismatch on dp{dp_idx}: "
+                f"[LWD] edge/cloud scheduling config mismatch on dp{connection_id}: "
                 f"(max_num_batched_tokens, max_num_seqs) edge={local} != "
                 f"cloud={remote}; a mismatch makes the cloud hold prefills "
                 "behind decodes forever, so start both sides with the same values"
             )
-        lwd_logger.info("[cloud-params] dp%d limits verified: %s", dp_idx, local)
+        lwd_logger.info("[cloud-params] %s limits verified: %s", connection_id, local)
 
-    def _lwd_send_to_cloud(self, dp_idx: int, message: LwdEdgeToCloudMessage) -> None:
-        """Send to one cloud DP rank, retrying a full outbound queue; raises
-        once the retries run out instead of losing the message."""
-        cloud = self._lwd_clouds[dp_idx]
+    def _lwd_send_to_cloud(
+        self, connection_id: LwdConnectionId, message: LwdEdgeToCloudMessage
+    ) -> None:
+        """Stamp and send on one connection, retrying only its full FIFO."""
+        cloud = self._lwd_clouds[connection_id]
+        self._lwd_stamp(cloud, message)
         for attempt in range(_LWD_SEND_RETRY_STEPS):
             if self._lwd_send(cloud, message):
                 return
             time.sleep(_LWD_SEND_RETRY_INTERVAL_S * (attempt + 1))
         raise RuntimeError(
-            f"[LWD] {type(message).__name__} to cloud dp{dp_idx} {cloud} not "
+            f"[LWD] {type(message).__name__} to cloud dp{connection_id} {cloud} not "
             f"sent: outbound queue still full after {_LWD_SEND_RETRY_STEPS} "
             "retries (cloud stalled or gone?)"
         )
@@ -243,12 +249,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_enqueue_request(request)
 
     def _lwd_admit_and_notify(self, request: Request) -> None:
-        dp_idx = self.scheduler.lwd_admit_request(request)
-        client = self._lwd_coord_clients.get(dp_idx)
+        connection_id = self.scheduler.lwd_admit_request(request)
+        client = self._lwd_coord_clients.get(connection_id)
         try:
             if client is not None:
                 client.send_first_req()
-            self._lwd_notify_request(dp_idx, request)
+            self._lwd_notify_request(connection_id, request)
         except Exception:
             self.scheduler.lwd_edge_cancel_admission(request.request_id)
             raise
@@ -293,15 +299,17 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if control is not None:
             control.prepare_abort(request_ids)
         routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
-        for dp_idx, request_id in routed_aborts:
+        for connection_id, request_id in routed_aborts:
             request = getattr(self.scheduler, "requests", {}).get(request_id)
             self._lwd_send_to_cloud(
-                dp_idx,
+                connection_id,
                 LwdAbortNotify(request_id, getattr(request, "lwd_prefix_nonce", 0)),
             )
         super().abort_requests(request_ids)
 
-    def _lwd_notify_request(self, dp_idx: int, request: Request) -> None:
+    def _lwd_notify_request(
+        self, connection_id: LwdConnectionId, request: Request
+    ) -> None:
         """Announce the request to one cloud DP rank, packing the sampling
         fields from the shared table."""
         sampling_params = request.sampling_params
@@ -313,7 +321,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
         self._lwd_send_to_cloud(
-            dp_idx,
+            connection_id,
             LwdRequestNotify(
                 request_id=request.request_id,
                 num_prompt_tokens=request.num_prompt_tokens,

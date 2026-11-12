@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Cloud engine cores for one edge connection per DP rank.
+"""Cloud engine cores and their LWD control-plane seams.
 
 Range notifies post extended early-receive hints, request notifies become
 native ADDs with prompt-length and M-RoPE metadata, and abort notifies use the
-native ABORT path. Step metadata is flushed to the edge in post_step.
+native ABORT path. Step metadata is flushed to the edge in post_step. The
+transport accepts independent per-edge sessions; MR4 owns multi-edge request
+namespaces and role-side output accounting.
 
 The LWD seams live in LwdCloudEngineCoreMixin and are orthogonal to the
 engine base: LwdCloudEngineCore (EngineCoreProc) serves one DP rank of a
@@ -23,6 +25,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+import msgspec
 import torch
 
 from vllm.lwd_logger import lwd_logger
@@ -204,19 +207,19 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Engine thread: remember the edge and send it the scheduling
         limits before anything else."""
         self._lwd_edge = peer
-        self._lwd_send_until_queued(peer, self._lwd_cloud_params)
+        params = msgspec.structs.replace(self._lwd_cloud_params)
+        self._lwd_send_until_queued(peer, params)
         lwd_logger.info(
             "[cloud] edge %s registered; scheduling limits sent: %s",
             peer,
-            self._lwd_cloud_params,
+            params,
         )
 
     def _lwd_send_until_queued(
         self, peer: LwdPeer, message: LwdCloudToEdgeMessage
     ) -> None:
-        """Retry a full outbound queue until the message is queued; gives up
-        with an error once shutdown is requested, so a stalled edge cannot
-        block it."""
+        """Retry a full per-peer FIFO until queued, or until shutdown starts."""
+        self._lwd_stamp(peer, message)
         while not self._lwd_send(peer, message):
             if self.shutdown_state != EngineShutdownState.RUNNING:
                 lwd_logger.error(

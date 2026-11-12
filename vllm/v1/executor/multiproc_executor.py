@@ -990,10 +990,21 @@ class WorkerProc:
         if ready_event is not None:
             delattr(inner, "lwd_meta_ready_event")
         carrier = getattr(inner, "lwd_down_carrier", None)
-        if carrier is not None and len(carrier) == 5:
+        if carrier is not None and len(carrier) in (5, 6):
             if ready_event is None:
                 raise RuntimeError("LWD DOWN carrier is missing its ready event")
-            meta_dev, seg_lens_host, req_ids, hidden_numel, seqno = carrier
+            if len(carrier) == 5:
+                meta_dev, seg_lens_host, req_ids, hidden_numel, seqno = carrier
+                connection_id = None
+            else:
+                (
+                    meta_dev,
+                    seg_lens_host,
+                    req_ids,
+                    hidden_numel,
+                    seqno,
+                    connection_id,
+                ) = carrier
             stream = getattr(self, "_lwd_harvest_stream", None)
             if stream is None:
                 stream = self._lwd_harvest_stream = torch.npu.Stream()
@@ -1013,11 +1024,16 @@ class WorkerProc:
             done.synchronize()
             if n_seg:
                 buf.numpy()[n_dev:n_meta] = seg_lens_host
-            inner.lwd_down_carrier = (
+            harvested_carrier = (
                 buf[:n_meta],
                 req_ids,
                 hidden_numel,
                 seqno,
+            )
+            inner.lwd_down_carrier = (
+                harvested_carrier
+                if connection_id is None
+                else (*harvested_carrier, connection_id)
             )
             lwd_logger.info(
                 "[Lwd][perf] meta-harvest dur=%.2fms ts=%.3f",

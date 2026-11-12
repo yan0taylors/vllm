@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-cloud-DP account of the edge scheduler.
 
-One account holds everything the edge knows about one cloud DP rank: its
-seqno stream (the UP pairing contract is per channel, so every engine has
-its own), its pending prefill batches, its request load and its gate
-state. The scheduler keeps one account per DP connection plus one routing
-table (request id -> dp_idx) that is pinned at admission and never
-changes: a request's KV and scheduler state live only in its target
-engine, so every chunk, abort and result travels through the account of
-the engine the request was routed to.
+One account holds everything the edge knows about one full connection: its
+seqno stream (the UP pairing contract is per channel, so every connection has
+its own), its pending prefill batches, its request load and its gate state.
+The scheduler keys accounts by LwdConnectionId and pins each request route at
+admission: a request's KV and scheduler state live only in its target engine,
+so every chunk, abort and result travels through that connection's account.
 
 Load counts are maintained incrementally on the same transitions that
 change the routing table, instead of rescanning every request on every
@@ -18,18 +16,22 @@ gate check.
 
 from __future__ import annotations
 
+from vllm.config.lwd import LwdConnectionId
+
 LWD_MAX_PENDING_CHUNKS = 10
 
 
 class LwdCloudDpAccount:
-    """The edge-side bookkeeping of one cloud DP rank."""
+    """The edge-side bookkeeping of one full edge-to-cloud DP connection."""
 
     def __init__(
         self,
-        dp_idx: int,
+        connection_id: LwdConnectionId | int,
         max_pending_chunks: int = LWD_MAX_PENDING_CHUNKS,
     ) -> None:
-        self.dp_idx = dp_idx
+        if isinstance(connection_id, int):
+            connection_id = LwdConnectionId(0, 0, connection_id)
+        self.connection_id = connection_id
         self.max_pending_chunks = max_pending_chunks
         self.seqno = 0
         """Next UP pairing number of this engine; taken only by a range
@@ -50,6 +52,11 @@ class LwdCloudDpAccount:
         results."""
         self.gate_held = False
         """Gate state of the last transition, for HOLD/OPEN logging only."""
+
+    @property
+    def dp_idx(self) -> int:
+        """Compatibility view for diagnostics, not an independent map key."""
+        return self.connection_id.dp_idx
 
     # ------------------------------------------------------------------ load
 

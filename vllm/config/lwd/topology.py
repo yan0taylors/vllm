@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
+import msgspec
 import yaml
 from pydantic import (
     AfterValidator,
@@ -82,8 +83,7 @@ class LwdControlPlaneConfig:
     """Edge-cloud control link tunables, shared by every instance."""
 
     send_queue_max: Annotated[int, Field(strict=True, ge=1)] = 1000
-    """Outbound messages buffered per DP rank before sending reports
-    backpressure."""
+    """Outbound messages buffered per peer before sending reports backpressure."""
     hello_retry_interval_s: LwdPositiveSeconds = 5.0
     """Seconds between edge registration attempts until the cloud answers."""
     handshake_timeout_s: LwdPositiveSeconds = 1800.0
@@ -103,6 +103,7 @@ class LwdCoordination:
     # Cloud-side fields
     listen_host: LwdString = "0.0.0.0"
     listen_port: LwdPort = 8100
+    instance_id: LwdString | None = None
     # Shared
     connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
         10.0
@@ -147,6 +148,16 @@ class LwdLink:
     cloud: LwdId
 
 
+class LwdConnectionId(
+    msgspec.Struct, frozen=True, order=True, array_like=True, gc=False
+):  # type: ignore[call-arg]
+    """Stable identity of one edge-to-cloud DP connection."""
+
+    edge_id: int
+    cloud_id: int
+    dp_idx: int
+
+
 @dataclass(frozen=True)
 class LwdDPConnection:
     """One explicit instance link expanded at matching DP indices."""
@@ -156,6 +167,14 @@ class LwdDPConnection:
     dp_idx: int
     edge: LwdDP
     cloud: LwdDP
+
+    @property
+    def connection_id(self) -> LwdConnectionId:
+        return LwdConnectionId(self.edge_id, self.cloud_id, self.dp_idx)
+
+    @property
+    def edge_leader_rank(self) -> int:
+        return self.edge.ranks[0]
 
     @property
     def cloud_leader_rank(self) -> int:
@@ -296,27 +315,28 @@ class LwdTopology:
             raise ValueError("[LWD] single_instance requires one edge and one cloud")
         if scene == "cloud_share" and (edge_count < 2 or cloud_count != 1):
             raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
-        if scene == "lwd_cluster" and (edge_count < 2 or cloud_count < 2):
-            raise ValueError("[LWD] lwd_cluster requires multiple edges and clouds")
-        # coordination only exists for cloud_share, embedded in each instance
-        if scene == "cloud_share":
-            for edge in self.edges:
-                if edge.coordination is None or not edge.coordination.enabled:
-                    raise ValueError(
-                        "[LWD] cloud_share requires each edge instance to have "
-                        "an enabled coordination block"
-                    )
-            for cloud in self.clouds:
-                if cloud.coordination is None or not cloud.coordination.enabled:
-                    raise ValueError(
-                        "[LWD] cloud_share requires each cloud instance to have "
-                        "an enabled coordination block"
-                    )
+        if scene == "lwd_cluster" and (edge_count < 1 or cloud_count < 2):
+            raise ValueError(
+                "[LWD] lwd_cluster requires at least one edge and two clouds"
+            )
+        # Coordination is optional, but a coordinated scene must enable it on
+        # every instance so no edge/cloud pair disagrees about the protocol.
+        if scene in ("cloud_share", "lwd_cluster"):
+            instances = (*self.edges, *self.clouds)
+            enabled = [
+                instance.coordination is not None and instance.coordination.enabled
+                for instance in instances
+            ]
+            if any(enabled) and not all(enabled):
+                raise ValueError(
+                    "[LWD] coordination must be consistently enabled or disabled "
+                    "on every edge and cloud instance"
+                )
         else:
             for instance in (*self.edges, *self.clouds):
                 if instance.coordination is not None:
                     raise ValueError(
-                        f"[LWD] coordination is only allowed in cloud_share scene, "
+                        "[LWD] coordination requires cloud_share/lwd_cluster, "
                         f"got scene={scene}"
                     )
         if scene == "edge_share":
@@ -358,7 +378,7 @@ class LwdTopology:
                         cloud_dp,
                     )
                 )
-        return tuple(result)
+        return tuple(sorted(result, key=lambda connection: connection.connection_id))
 
     def instance(self, role: str, instance_id: int) -> LwdInstance:
         if role not in ("edge", "cloud"):

@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Socket-free handshake state machines of the LWD control link.
 
-The edge registers with `LwdLinkHello` until the cloud answers with
-`LwdLinkAccept` or `LwdLinkReject`. A cloud DP rank serves one edge for now.
+The edge registers each connection with `LwdLinkHello` until its cloud answers
+with `LwdLinkAccept` or `LwdLinkReject`. A cloud DP rank keeps independent
+sessions for every edge declared by the topology.
 """
 
 from dataclasses import dataclass
@@ -25,9 +26,15 @@ class LwdHandshakeError(RuntimeError):
 
 
 class LwdEdgeHandshake:
-    def __init__(self, hello: LwdLinkHello, hello_retry_interval_s: float) -> None:
+    def __init__(
+        self,
+        hello: LwdLinkHello,
+        hello_retry_interval_s: float,
+        expected_cloud_id: int | None = None,
+    ) -> None:
         self.hello = hello
         self._hello_retry_interval_s = hello_retry_interval_s
+        self._expected_cloud_id = expected_cloud_id
         self._last_hello_at: float | None = None
         self.cloud: LwdPeer | None = None
 
@@ -65,10 +72,13 @@ class LwdEdgeHandshake:
             self.hello.session_id,
         )
         actual = (msg.link_version, msg.dp_rank, msg.dp_size, msg.session_id)
+        if self._expected_cloud_id is not None:
+            expected = (*expected, self._expected_cloud_id)
+            actual = (*actual, msg.instance_id)
         if actual != expected:
             raise LwdHandshakeError(
-                f"accept (link_version, dp_rank, dp_size, session) = {actual} "
-                f"does not answer hello {expected}"
+                f"accept (link_version, dp_rank, dp_size, session, cloud_id) = "
+                f"{actual} does not answer hello {expected}"
             )
         if self.cloud is None:
             self.cloud = LwdPeer(msg.instance_id, msg.dp_rank)
@@ -78,7 +88,9 @@ class LwdEdgeHandshake:
 class LwdCloudHandshakeDecision:
     reply: LwdLinkAccept | LwdLinkReject
     registered: LwdPeer | None = None
-    """Set when this hello registered a new edge."""
+    """Set when this hello registers a new or replacement edge session."""
+    resend: LwdPeer | None = None
+    """Set when a same-session retry must replay peer-up initialization."""
 
 
 @dataclass(frozen=True)
@@ -89,44 +101,62 @@ class _LwdEdgeSession:
 
 
 class LwdCloudHandshake:
-    """Registers edges on one cloud DP rank and maps them to ZMQ identities."""
+    """Map every registered edge peer to its current ZMQ session identity."""
 
-    def __init__(self, instance_id: int, dp_rank: int, dp_size: int) -> None:
+    def __init__(
+        self,
+        instance_id: int,
+        dp_rank: int,
+        dp_size: int,
+        expected_edge_ids: tuple[int, ...] = (),
+    ) -> None:
         self._instance_id = instance_id
         self._dp_rank = dp_rank
         self._dp_size = dp_size
-        # TODO(lwd): turn the single slot into a session table to serve
-        # several edges per cloud DP rank, issue #8.
-        self._session: _LwdEdgeSession | None = None
+        self._expected_edge_ids = frozenset(expected_edge_ids)
+        self._sessions_by_identity: dict[bytes, _LwdEdgeSession] = {}
+        self._sessions_by_peer: dict[LwdPeer, _LwdEdgeSession] = {}
 
     def peer_of(self, identity: bytes) -> LwdPeer | None:
-        session = self._session
-        if session is None or session.identity != identity:
-            return None
-        return session.peer
+        session = self._sessions_by_identity.get(identity)
+        return session.peer if session is not None else None
 
     def identity_of(self, peer: LwdPeer) -> bytes | None:
-        session = self._session
-        if session is None or session.peer != peer:
-            return None
-        return session.identity
+        session = self._sessions_by_peer.get(peer)
+        return session.identity if session is not None else None
 
     def on_hello(
         self, identity: bytes, hello: LwdLinkHello
     ) -> LwdCloudHandshakeDecision:
         reason = self._mismatch_reason(identity, hello)
-        if reason is None:
-            reason = self._occupied_reason(hello)
         if reason is not None:
             return LwdCloudHandshakeDecision(LwdLinkReject(reason))
-        if self._session is not None:
-            # Retried hello of the registered session.
-            return LwdCloudHandshakeDecision(self._accept(hello))
         peer = LwdPeer(hello.instance_id, hello.dp_rank)
-        self._session = _LwdEdgeSession(peer, identity, hello.session_id)
+        previous = self._sessions_by_peer.get(peer)
+        if previous is not None and previous.session_id == hello.session_id:
+            if previous.identity != identity:
+                return LwdCloudHandshakeDecision(
+                    LwdLinkReject("session resumed with a different ZMQ identity")
+                )
+            # A retried hello can mean that its ACCEPT or the resulting
+            # peer-up parameters were lost. Replay initialization without
+            # registering the live session again.
+            return LwdCloudHandshakeDecision(self._accept(hello), resend=peer)
+        if previous is not None:
+            # A restarted edge has a new session and identity. Replace both
+            # indexes atomically; payloads on the old identity lose their peer.
+            self._sessions_by_identity.pop(previous.identity, None)
+        session = _LwdEdgeSession(peer, identity, hello.session_id)
+        self._sessions_by_identity[identity] = session
+        self._sessions_by_peer[peer] = session
         return LwdCloudHandshakeDecision(self._accept(hello), registered=peer)
 
     def _mismatch_reason(self, identity: bytes, hello: LwdLinkHello) -> str | None:
+        if self._expected_edge_ids and hello.instance_id not in self._expected_edge_ids:
+            return (
+                f"edge instance {hello.instance_id} is not connected to cloud "
+                f"{self._instance_id} dp{self._dp_rank} in the topology"
+            )
         if hello.link_version != LWD_LINK_PROTOCOL_VERSION:
             return (
                 f"link protocol version {hello.link_version} != cloud "
@@ -147,33 +177,13 @@ class LwdCloudHandshake:
         expected = lwd_edge_identity(hello.instance_id, hello.dp_rank, hello.session_id)
         if identity != expected:
             return f"identity {identity!r} != expected {expected!r}"
-        return None
-
-    def _occupied_reason(self, hello: LwdLinkHello) -> str | None:
-        session = self._session
-        if session is None:
-            return None
-        if session.peer.instance_id != hello.instance_id:
-            return (
-                f"cloud dp{self._dp_rank} already serves edge instance "
-                f"{session.peer.instance_id}; one edge per cloud DP rank is "
-                "supported"
-            )
-        if session.session_id != hello.session_id:
-            # TODO(lwd): once peer loss is detected, reject only while the
-            # registered session is alive and replace it otherwise, issue #8.
-            return (
-                f"an edge with the same configuration (instance "
-                f"{hello.instance_id}, dp{hello.dp_rank}) is already registered "
-                f"on cloud {self._instance_id} dp{self._dp_rank} as session "
-                f"{session.session_id}; this process is session "
-                f"{hello.session_id}. Either a duplicate edge process uses the "
-                "same instance_id (fix the deployment), or the edge restarted "
-                "(restart the cloud as well)"
-            )
+        session = self._sessions_by_identity.get(identity)
+        if session is not None and session.peer.instance_id != hello.instance_id:
+            return f"identity {identity!r} is already registered to {session.peer}"
         return None
 
     def _accept(self, hello: LwdLinkHello) -> LwdLinkAccept:
+
         return LwdLinkAccept(
             link_version=LWD_LINK_PROTOCOL_VERSION,
             instance_id=self._instance_id,

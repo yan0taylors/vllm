@@ -12,6 +12,7 @@ from typing import Any
 
 import msgspec
 
+from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
@@ -26,6 +27,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdMessage,
     lwd_encode_message,
+    lwd_message_connection_id,
+    lwd_stamp_message,
+    lwd_validate_message_connection,
 )
 
 
@@ -96,6 +100,9 @@ class LwdBaseEngineCore(EngineCoreProc):
         if not scheduler_config.enable_chunked_prefill and chunked_prefill_wanted:
             scheduler_config.enable_chunked_prefill = True
         self.lwd_config = vllm_config.lwd_config
+        self._lwd_connection_ids = frozenset(
+            connection.connection_id for connection in self.lwd_config.connections
+        )
         try:
             self._lwd_assemble()
         except BaseException:
@@ -123,8 +130,37 @@ class LwdBaseEngineCore(EngineCoreProc):
         )
         return plane
 
+    def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
+        edge_id = (
+            self.lwd_config.instance_id
+            if self.lwd_config.role == "edge"
+            else peer.instance_id
+        )
+        cloud_id = (
+            peer.instance_id
+            if self.lwd_config.role == "edge"
+            else self.lwd_config.instance_id
+        )
+        connection_id = LwdConnectionId(edge_id, cloud_id, peer.dp_rank)
+        if connection_id not in self._lwd_connection_ids:
+            raise ValueError(
+                f"[LWD] peer {peer} is not a topology connection of "
+                f"{self.lwd_config.role} {self.lwd_config.instance_id}"
+            )
+        return connection_id
+
+    def _lwd_stamp(self, peer: LwdPeer, message: LwdMessage) -> None:
+        connection_id = self._lwd_connection_of(peer)
+        actual = lwd_message_connection_id(message)
+        if actual != LwdConnectionId(0, 0, 0):
+            lwd_validate_message_connection(message, connection_id)
+            return
+        lwd_stamp_message(message, connection_id)
+
     def _lwd_send(self, peer: LwdPeer, message: LwdMessage) -> bool:
-        """Queue `message` for `peer`; False when the outbound queue is full."""
+        """Queue a stamped message; False means this peer's FIFO is full."""
+        expected = self._lwd_connection_of(peer)
+        lwd_validate_message_connection(message, expected)
         assert self._lwd_sender is not None, "control plane not started"
         return self._lwd_sender.send(peer, lwd_encode_message(message))
 
@@ -144,8 +180,12 @@ class LwdBaseEngineCore(EngineCoreProc):
         warning."""
         try:
             msg = self._lwd_decode(payload)
+            lwd_validate_message_connection(msg, self._lwd_connection_of(peer))
         except (msgspec.DecodeError, msgspec.ValidationError) as e:
             lwd_logger.warning("[comm] drop malformed payload from %s: %s", peer, e)
+            return
+        except ValueError as e:
+            self._lwd_fail(f"invalid payload from {peer}: {e}")
             return
         if not self._lwd_dispatch_message(peer, msg):
             lwd_logger.warning(

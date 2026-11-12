@@ -122,6 +122,7 @@ def build_topology(
     listen_host: str = "0.0.0.0",
     listen_port: int = 8100,
     control_url: str | None = None,
+    enable_coordination: bool = False,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
@@ -132,6 +133,8 @@ def build_topology(
         raise ValueError("All generated control ports must be within 1..65535")
     if scene == "edge_share" and "@" not in cloud_machines:
         raise ValueError("edge_share requires --cloud-machines ID@IP entries")
+    if enable_coordination and scene not in ("cloud_share", "lwd_cluster"):
+        raise ValueError("coordination requires cloud_share/lwd_cluster")
     cloud_instances = _cloud_instances(cloud_machines, cloud_cards, dp)
     instances = _edge_instances(scene, edge_machines, len(cloud_instances))
     shared = scene == "edge_share"
@@ -169,8 +172,7 @@ def build_topology(
         "clouds": clouds,
         "instance_links": links,
     }
-    if scene == "cloud_share":
-        # Parse consumer_ids into a list, one per edge instance.
+    if enable_coordination:
         consumer_id_list = [cid.strip() for cid in consumer_ids.split(",")]
         if len(consumer_id_list) != len(edges):
             raise ValueError(
@@ -222,6 +224,11 @@ def main() -> None:
     parser.add_argument("--enable-early-recv", action="store_true")
     parser.add_argument("--enable-scramble", action="store_true")
     parser.add_argument(
+        "--enable-coordination",
+        action="store_true",
+        help="Embed enabled coordination blocks in cloud_share/lwd_cluster",
+    )
+    parser.add_argument(
         "--scramble-device-id",
         default=None,
         help="Payload scramble: shared device-pair fingerprint",
@@ -234,36 +241,42 @@ def main() -> None:
     parser.add_argument(
         "--tenant-key-file",
         default="/run/secrets/edge-cloud-tenant-key",
-        help="cloud_share only: tenant key file path on edge side",
+        help="cloud_share/lwd_cluster: tenant key file path on edge side",
     )
     parser.add_argument(
         "--consumer-ids",
         default="enterprise-a",
-        help="cloud_share only: comma-separated consumer IDs, one per edge instance",
+        help=(
+            "cloud_share/lwd_cluster: comma-separated consumer IDs, "
+            "one per edge instance"
+        ),
     )
     parser.add_argument(
         "--control-url",
         default=None,
         help=(
-            "cloud_share only: edge->cloud control service URL; auto-derived if omitted"
+            "cloud_share/lwd_cluster: edge->cloud control service URL; "
+            "auto-derived if omitted"
         ),
     )
     parser.add_argument(
         "--connect-timeout",
         type=float,
         default=5.0,
-        help="cloud_share only: edge->cloud control connection timeout (seconds)",
+        help=(
+            "cloud_share/lwd_cluster: edge->cloud control connection timeout (seconds)"
+        ),
     )
     parser.add_argument(
         "--listen-host",
         default="0.0.0.0",
-        help="cloud_share only: cloud-side coordination service listen host",
+        help="cloud_share/lwd_cluster: cloud-side coordination service listen host",
     )
     parser.add_argument(
         "--listen-port",
         type=int,
         default=8100,
-        help="cloud_share only: cloud-side coordination service listen port",
+        help="cloud_share/lwd_cluster: cloud-side coordination service listen port",
     )
     parser.add_argument(
         "-o", "--output", type=Path, required=True, help="One output YAML file"
@@ -283,6 +296,7 @@ def main() -> None:
             connect_timeout=args.connect_timeout,
             listen_host=args.listen_host,
             listen_port=args.listen_port,
+            enable_coordination=args.enable_coordination,
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,

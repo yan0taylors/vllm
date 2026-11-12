@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.config.lwd import LwdConnectionId
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -373,8 +374,8 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
-    # Per-DP contiguous UP send-completion watermarks.
-    lwd_up_send_watermarks: dict[int, int] = field(default_factory=dict)
+    # Per-connection contiguous UP send-completion watermarks.
+    lwd_up_send_watermarks: dict[LwdConnectionId, int] = field(default_factory=dict)
 
     @staticmethod
     def with_kv_conn_output_only(

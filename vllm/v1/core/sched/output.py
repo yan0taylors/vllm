@@ -8,6 +8,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
+from vllm.config.lwd import LwdConnectionId
 from vllm.multimodal.utils import strip_covered_mm_data
 
 if TYPE_CHECKING:
@@ -58,11 +59,17 @@ class LwdEmbedBatch:
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
-    dp_idx: int = 0
-    """Cloud DP rank this batch travels to; the edge worker picks the UP
-    channel of this DP connection. 0 keeps single-cloud behaviour."""
+    connection_id: LwdConnectionId = field(
+        default_factory=lambda: LwdConnectionId(0, 0, 0)
+    )
+    """Full edge-to-cloud DP connection used to select the UP channel."""
     aborted_req_ids: list[str] = field(default_factory=list)
     is_refill: bool = False
+
+    @property
+    def dp_idx(self) -> int:
+        """Compatibility view for existing workers, never a separate map key."""
+        return self.connection_id.dp_idx
 
 
 @dataclass
@@ -85,9 +92,15 @@ class LwdUnembedBatch:
     token_ids: list[list[int]] = field(
         default_factory=list
     )  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
-    dp_idx: int = 0
-    """Cloud DP rank this batch arrived from; the edge worker picks the
-    DOWN channel of this DP connection. 0 keeps single-cloud behaviour."""
+    connection_id: LwdConnectionId = field(
+        default_factory=lambda: LwdConnectionId(0, 0, 0)
+    )
+    """Full edge-to-cloud DP connection used to select the DOWN channel."""
+
+    @property
+    def dp_idx(self) -> int:
+        """Compatibility view for existing workers, never a separate map key."""
+        return self.connection_id.dp_idx
 
 
 @dataclass

@@ -213,9 +213,9 @@ class LwdEdgeTransport(LwdControlTransport):
 
     One socket per link: a DEALER with several connects would round-robin
     sends across the clouds and replies could not be attributed to a link.
-    Link i connects to cloud DP rank i and carries the identity of that
-    link's handshake; a full or unestablished link reports EAGAIN for its
-    own sends only.
+    Link indices are local to the edge plane's ordered connection table, so
+    equal DP indices on different clouds remain distinct. A full or
+    unestablished link reports EAGAIN for its own sends only.
     """
 
     _SOCKET_TYPE = zmq.DEALER
@@ -223,6 +223,8 @@ class LwdEdgeTransport(LwdControlTransport):
     def __init__(
         self, endpoints: tuple[str, ...], identities: tuple[bytes, ...]
     ) -> None:
+        if not endpoints:
+            raise ValueError("[LWD] edge transport needs at least one endpoint")
         super().__init__(endpoints[0])
         if len(endpoints) != len(identities):
             raise ValueError(

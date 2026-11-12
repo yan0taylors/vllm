@@ -16,12 +16,14 @@ from typing import Any, TypeAlias, TypeVar, cast
 
 import msgspec
 
+from vllm.config.lwd import LwdConnectionId
+
 T = TypeVar("T")
 
-# 4: LwdRequestNotify gained `structured_outputs`. An old cloud would drop
-# the constraint silently (msgspec skips unknown fields on decode), so mixed
-# versions fail the handshake instead of serving unstructured output.
-LWD_MESSAGE_VERSION = 4
+# 6: every control notification carries its full (edge, cloud, DP) connection.
+# Version 5 is reserved for the historical 1108 branch and is deliberately
+# skipped; peers with missing or mismatched stamps fail fast outside 1E1C.
+LWD_MESSAGE_VERSION = 6
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
@@ -54,6 +56,10 @@ class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     seqno: int
     """Batch number pairing the batch with its data-plane transfer."""
     items: list[LwdRangeItem] = []
+    edge_id: int = 0
+    cloud_id: int = 0
+    dp_idx: int = 0
+    """Connection stamp; all zero is the implicit 1E1C form."""
 
 
 class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -94,6 +100,9 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     `StructuredOutputsParams`; empty for a plain request. The cloud rebuilds
     the params, compiles the grammar and applies the sampling bitmask; the
     edge compiles its own copy only for the picker's grammar-ready filter."""
+    edge_id: int = 0
+    cloud_id: int = 0
+    dp_idx: int = 0
 
 
 def lwd_encode_structured_outputs(params: Any) -> str:
@@ -173,6 +182,9 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     request_id: str
     prefix_nonce: int = 0
     """Generation to abort; zero is the legacy form."""
+    edge_id: int = 0
+    cloud_id: int = 0
+    dp_idx: int = 0
 
 
 class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -195,6 +207,9 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     prefix_alignment_tokens: int = 0
     prefix_alignment_required: bool = False
     prefix_use_eagle: bool = False
+    edge_id: int = 0
+    cloud_id: int = 0
+    dp_idx: int = 0
 
 
 class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -204,6 +219,9 @@ class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     hit_tokens: int
     nonce: int
     error: str = ""
+    edge_id: int = 0
+    cloud_id: int = 0
+    dp_idx: int = 0
 
 
 class LwdRefillNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -214,6 +232,9 @@ class LwdRefillNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-
     end_row: int
     prefix_nonce: int = 0
     """Request generation that requested this refill; zero is the legacy form."""
+    edge_id: int = 0
+    cloud_id: int = 0
+    dp_idx: int = 0
 
 
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -238,6 +259,10 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     edge skips sampling."""
     prefix_nonces: list[int] = []
     """Generation of each request row, aligned with req_ids."""
+    edge_id: int = 0
+    cloud_id: int = 0
+    dp_idx: int = 0
+    """Source connection of this C2E carrier."""
 
 
 LwdEdgeToCloudMessage: TypeAlias = LwdRequestNotify | LwdRangeNotify | LwdAbortNotify
@@ -245,6 +270,36 @@ LwdCloudToEdgeMessage: TypeAlias = (
     LwdCloudParamsNotify | LwdC2eNotify | LwdPrefixReadyNotify | LwdRefillNotify
 )
 LwdMessage: TypeAlias = LwdEdgeToCloudMessage | LwdCloudToEdgeMessage
+
+
+def lwd_message_connection_id(message: LwdMessage) -> LwdConnectionId:
+    """Read the connection envelope shared by every business notification."""
+    return LwdConnectionId(message.edge_id, message.cloud_id, message.dp_idx)
+
+
+def lwd_stamp_message(
+    message: LwdMessage, connection_id: LwdConnectionId
+) -> LwdMessage:
+    """Stamp a notification immediately before encoding it for its peer."""
+    message.edge_id = connection_id.edge_id
+    message.cloud_id = connection_id.cloud_id
+    message.dp_idx = connection_id.dp_idx
+    return message
+
+
+def lwd_validate_message_connection(
+    message: LwdMessage, expected: LwdConnectionId
+) -> None:
+    """Reject missing or incorrect stamps instead of misrouting a notification."""
+    actual = lwd_message_connection_id(message)
+    if actual == expected:
+        return
+    reason = "missing" if actual == LwdConnectionId(0, 0, 0) else "mismatched"
+    raise ValueError(
+        f"[LWD] {reason} connection stamp on {type(message).__name__}: "
+        f"got {actual}, expected {expected}"
+    )
+
 
 _LWD_EDGE_TO_CLOUD_DECODER = msgspec.msgpack.Decoder(LwdEdgeToCloudMessage)
 _LWD_CLOUD_TO_EDGE_DECODER = msgspec.msgpack.Decoder(LwdCloudToEdgeMessage)
