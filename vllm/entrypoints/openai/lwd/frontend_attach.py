@@ -132,6 +132,30 @@ def _additional_config_dict(args: Any) -> dict[str, Any]:
     return additional if isinstance(additional, dict) else {}
 
 
+def _resolve_frontend_count(
+    scene: str, edge_count: int, requested_count: int | None
+) -> int:
+    """Resolve the K frontend count from the deployment scene.
+
+    Legacy ``edge_share`` keeps the one-to-one pairing: K is the edge
+    instance count and an explicit ``--api-server-count`` must equal it.
+    Decoupled ``cloud_share``/``lwd_cluster`` scenes treat K as a pure
+    output-grouping concern, defaulting to one and no longer tied to the
+    cloud or instance count.
+    """
+    if scene == "edge_share":
+        if requested_count is not None and requested_count != edge_count:
+            raise ValueError(
+                f"[LWD] --api-server-count ({requested_count}) must equal the "
+                f"edge_share frontend count ({edge_count})"
+            )
+        return edge_count
+    count = requested_count if requested_count is not None else 1
+    if count < 1:
+        raise ValueError("[LWD] --api-server-count must be positive")
+    return count
+
+
 def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
     """Resolve frontend index/count from the same topology used by engines."""
     api = LwdAPIConfig.from_namespace(args)
@@ -141,13 +165,11 @@ def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
         raise ValueError("[LWD] API attachment supports Python HTTP frontends only")
     lwd = resolve_lwd_config(_additional_config_dict(args), api=api)
     assert lwd is not None
-    count = len(lwd.topology.edges)
-    requested_count = getattr(args, "api_server_count", None)
-    if requested_count is not None and requested_count != count:
-        raise ValueError(
-            f"[LWD] --api-server-count ({requested_count}) must equal the "
-            f"edge_share frontend count ({count})"
-        )
+    count = _resolve_frontend_count(
+        lwd.topology.deployment.scene,
+        len(lwd.topology.edges),
+        getattr(args, "api_server_count", None),
+    )
     mode = "primary" if api.api_server_rpc_port is not None else "attach"
     endpoint = api.api_server_rpc_port or api.api_server_attach
     assert endpoint is not None
@@ -549,7 +571,9 @@ def create_frontend_registration_server(
     plan = resolve_attach_plan(args)
     assert plan is not None and plan.mode == "primary"
     if client_count != plan.client_count:
-        raise ValueError("[LWD] API server count does not match edge_share topology")
+        raise ValueError(
+            "[LWD] API server count does not match the resolved LWD frontend count"
+        )
     return FrontendAttachServer(
         endpoint=plan.endpoint,
         client_count=client_count,

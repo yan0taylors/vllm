@@ -111,5 +111,12 @@ class LwdAPIConfig:
             raise ValueError("[LWD] --api-server-rpc-port requires edge instance_id=0")
         if self.api_server_attach is not None and lwd.instance_id == 0:
             raise ValueError("[LWD] --api-server-attach requires a non-primary edge")
-        if lwd.topology.deployment.scene != "edge_share":
-            raise ValueError("[LWD] API attachment requires scene=edge_share")
+        if lwd.topology.deployment.scene not in (
+            "edge_share",
+            "cloud_share",
+            "lwd_cluster",
+        ):
+            raise ValueError(
+                "[LWD] API attachment requires "
+                "scene=edge_share, cloud_share, or lwd_cluster"
+            )
