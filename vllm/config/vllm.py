@@ -1273,13 +1273,13 @@ class VllmConfig:
             self.lwd_config = resolve_lwd_config(self.additional_config)
         if self.lwd_config is not None:
             log_lwd_config(logger, self.lwd_config)
-            if self.lwd_config.role == "cloud":
+            if self.lwd_config.role == "cloud":  # 【MR2】云侧角色初始化：云侧要编译结构化输出语法，所以下面单独放开 tokenizer 和 MM 配置
                 # Cloud-side structured output compiles grammars and therefore
                 # needs the tokenizer even though prompt rendering stays on edge.
-                self.model_config.skip_tokenizer_init = False
-                if self.model_config.multimodal_config is not None:
-                    self.model_config.multimodal_config.skip_mm_profiling = True
-                    self.model_config.multimodal_config.mm_encoder_remote = True
+                self.model_config.skip_tokenizer_init = False  # 【MR2】云侧不能跳过 tokenizer 初始化（prompt 仍在边侧渲染，这里只为语法编译保留）
+                if self.model_config.multimodal_config is not None:  # 【MR2】多模态配置切换到“云侧只跑 decoder”的模式
+                    self.model_config.multimodal_config.skip_mm_profiling = True  # 【MR2】跳过 MM profiling，避免云侧为视觉编码器预留显存
+                    self.model_config.multimodal_config.mm_encoder_remote = True  # 【MR2】MM encoder 走远端（边侧），云侧不加载视觉塔
 
         self._resolve_mm_encoder_only()
 

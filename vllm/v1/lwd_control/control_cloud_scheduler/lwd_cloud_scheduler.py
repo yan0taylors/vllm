@@ -14,9 +14,9 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
-import time
+import time  # 【MR2】新增 time：并发日志按 5 秒节流需要单调时钟
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace  # 【MR2】引入 dataclasses.replace，用“复制并覆盖字段”的方式改 KV 配置，避免原地修改共享对象
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -28,7 +28,7 @@ from vllm.v1.core.sched.output import (
     LwdEmbedBatch,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.scheduler import Scheduler as _NativeScheduler
+from vllm.v1.core.sched.scheduler import Scheduler as _NativeScheduler  # 【MR2】引入原生 Scheduler：下面复写 update 逻辑时直接复用它的实现
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     prefix_start,
 )
@@ -36,7 +36,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
+from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id  # 【MR2】引入 parse_edge_id：从云端请求 id 的 e{edge}- 前缀还原边编号
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
@@ -80,28 +80,28 @@ class LwdCloudScheduler(LwdBaseScheduler):
     """Mix all decode requests with prefill windows whose rows have arrived."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # LWD keeps every real Mamba checkpoint until the native mapping from
+        # LWD keeps every real Mamba checkpoint until the native mapping from  # 【MR2】LWD 暂用稠密 Mamba checkpoint；这里把稀疏保留间隔强制改成 None
         # state blocks to prefix boundaries supports sparse retention safely.
-        if len(args) > 1:
+        if len(args) > 1:  # 【MR2】位置参数构造：kv_cache_config 位于第 2 个参数
             kv_cache_config = args[1]
-            if kv_cache_config.prefix_cache_retention_interval is not None:
+            if kv_cache_config.prefix_cache_retention_interval is not None:  # 【MR2】只有配置了 retention_interval 才需要复制覆盖
                 lwd_logger.info(
-                    "[prefix] LWD uses dense Mamba checkpoints; override "
+                    "[prefix] LWD uses dense Mamba checkpoints; override "  # 【MR2】打印被覆盖的旧值，便于确认配置生效
                     "retention_interval=%s -> None",
                     kv_cache_config.prefix_cache_retention_interval,
                 )
-                kv_cache_config = replace(
+                kv_cache_config = replace(  # 【MR2】用 replace 生成新配置，不污染调用方对象
                     kv_cache_config, prefix_cache_retention_interval=None
                 )
-                args = (args[0], kv_cache_config, *args[2:])
-        elif kwargs["kv_cache_config"].prefix_cache_retention_interval is not None:
+                args = (args[0], kv_cache_config, *args[2:])  # 【MR2】把替换后的配置写回 args 再交给父类
+        elif kwargs["kv_cache_config"].prefix_cache_retention_interval is not None:  # 【MR2】关键字参数构造：同样拦截 kv_cache_config
             previous = kwargs["kv_cache_config"].prefix_cache_retention_interval
-            lwd_logger.info(
+            lwd_logger.info(  # 【MR2】日志同上，说明稀疏保留被关闭
                 "[prefix] LWD uses dense Mamba checkpoints; override "
                 "retention_interval=%s -> None",
                 previous,
             )
-            kwargs["kv_cache_config"] = replace(
+            kwargs["kv_cache_config"] = replace(  # 【MR2】关键字路径同样复制覆盖
                 kwargs["kv_cache_config"], prefix_cache_retention_interval=None
             )
         super().__init__(*args, **kwargs)
@@ -115,12 +115,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
-        self._lwd_prefill_group_cursor = 0
-        self.lwd_finished_records: dict[str, tuple[int, int]] = {}
-        self.lwd_hash_block_size = 0
-        self.lwd_prefix_hits: dict[str, int] = {}
-        self.lwd_refill_sender = None
-        self._lwd_conc_last_log = 0.0
+        self._lwd_prefill_group_cursor = 0  # 【MR2】按边轮转 prefill 窗口的游标，保证多条边公平分享 token 预算
+        self.lwd_finished_records: dict[str, tuple[int, int]] = {}  # 【MR2】完成请求快照：prompt 长度 + 输出 token 数，供引擎发布 usage
+        self.lwd_hash_block_size = 0  # 【MR2】前缀 hash 块大小（由云侧参数下发）
+        self.lwd_prefix_hits: dict[str, int] = {}  # 【MR2】每个请求当前的前缀命中数
+        self.lwd_refill_sender = None  # 【MR2】refill 通知发送器，由云引擎注入
+        self._lwd_conc_last_log = 0.0  # 【MR2】上一次并发日志时间，用于 5 秒节流
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
@@ -129,49 +129,49 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     _LWD_CONCURRENCY_LOG_INTERVAL_S = 5.0
 
-    def _lwd_log_concurrency(self) -> None:
+    def _lwd_log_concurrency(self) -> None:  # 【MR2】周期打印并发/积压快照：avail_rows 持续偏高说明数据到了但没被调度
         """[Lwd][conc] Periodic (~5s) concurrency and prefill-backlog snapshot.
 
         avail_rows sums (arrived - computed) rows over in-flight prefill
         requests: a sustained high value while the token budget is not
         saturated is direct evidence of "data arrived but not scheduled".
         """
-        now = time.monotonic()
+        now = time.monotonic()  # 【MR2】节流：距上次日志不足 5 秒直接返回
         if now - self._lwd_conc_last_log < self._LWD_CONCURRENCY_LOG_INTERVAL_S:
             return
         self._lwd_conc_last_log = now
-        ledger = self.lwd_recv_rows
+        ledger = self.lwd_recv_rows  # 【MR2】ledger 是每个请求已到达的行数
         total = len(self.requests)
         running = len(self.running)
         waiting = len(self.waiting) + len(self.skipped_waiting)
         decode_ready = 0
         prefill_inflight = 0
         avail_rows = 0
-        for queue in (self.running, self.waiting, self.skipped_waiting):
+        for queue in (self.running, self.waiting, self.skipped_waiting):  # 【MR2】把 running/waiting/skipped 三类队列一起统计
             for req in queue:
                 if req.num_computed_tokens >= req.num_prompt_tokens:
                     decode_ready += 1
                 else:
                     prefill_inflight += 1
-                    avail_rows += max(
+                    avail_rows += max(  # 【MR2】累计“已到达但还没计算”的行数
                         0,
                         int(ledger.get(req.request_id, 0)) - req.num_computed_tokens,
                     )
-        lwd_logger.info(
+        lwd_logger.info(  # 【MR2】输出并发概览：请求数、运行中、等待中、可算行数等
             "[Lwd][conc] total=%d running=%d waiting=%d decode_ready=%d "
             "prefill_inflight=%d avail_rows=%d ledger=%d budget=%d",
             total, running, waiting, decode_ready,
             prefill_inflight, avail_rows, len(ledger),
             self.max_num_scheduled_tokens,
         )
-        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()  # 【MR2】再采集 KV block、前缀预留和 refill 门控的快照
         reservations = getattr(self, "lwd_prefix_reservations", None)
         active_reservations = (
             reservations._reservations if reservations is not None else {}
         )
         n_reservations = len(active_reservations)
         n_pins = sum(len(r.pinned) for r in active_reservations.values())
-        lwd_logger.info(
+        lwd_logger.info(  # 【MR2】这些指标用于定位显存与门控问题
             "[lwd][dbg] snapshot free_blocks=%d total_blocks=%d reservations=%d "
             "pins=%d refill_gate=%d running=%d waiting=%d skipped=%d",
             free_blocks,
@@ -185,7 +185,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
-        self._lwd_log_concurrency()
+        self._lwd_log_concurrency()  # 【MR2】每步调度前先尝试打并发日志（内部有 5 秒节流）
         decode_ids = self._lwd_collect_decode_requests()
         decode_exact = self._lwd_compute_decode_consumption(decode_ids)
         room = self.max_num_scheduled_tokens - decode_exact
@@ -240,16 +240,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return decode_exact
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
-        """Revalidate a preempted request against live blocks and arrivals."""
-        if not getattr(request, "lwd_prefix_probe_succeeded", True):
+        """Revalidate a preempted request against live blocks and arrivals."""  # 【MR2】重准入时重新校验前缀命中
+        if not getattr(request, "lwd_prefix_probe_succeeded", True):  # 【MR2】探测失败（fail-open）的请求没有初始预留，直接按完整 prompt 重算
             # Fail-open requests have no initial reservation by contract.
             # Recompute the full prompt after preemption instead of creating a
             # fictitious zero-hit reservation or triggering a refill.
-            self.lwd_prefix_hits[request.request_id] = 0
+            self.lwd_prefix_hits[request.request_id] = 0  # 【MR2】命中数清零，既不建虚假的零命中预留，也不触发 refill
             return True
-        reservations = getattr(self, "lwd_prefix_reservations", None)
+        reservations = getattr(self, "lwd_prefix_reservations", None)  # 【MR2】前缀预留管理器
         assert reservations is not None
-        floor = self.lwd_prefix_hits.get(
+        floor = self.lwd_prefix_hits.get(  # 【MR2】以上次命中数为下限起点
             request.request_id, getattr(request, "lwd_resume_cap_tokens", 0)
         )
         if request.skip_reading_prefix_cache:
@@ -263,11 +263,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
 
         recv_rows = self.lwd_recv_rows.get(request.request_id, 0)
-        # Same alignment the probe path lands hits on (compressed-state
+        # Same alignment the probe path lands hits on (compressed-state  # 【MR2】对齐粒度必须和探测路径一致（压缩状态边界），不能用调度块大小
         # boundaries on fine-grained deployments), not the scheduling block:
         # clamping to the latter would discard a fine hit whenever recv_rows
         # is below one scheduler block.
-        alignment = self.kv_cache_manager.coordinator.cache_hit_alignment_tokens
+        alignment = self.kv_cache_manager.coordinator.cache_hit_alignment_tokens  # 【MR2】从 coordinator 取 cache_hit_alignment_tokens 作为对齐粒度
         clamped_hit = min(h_prime, recv_rows // alignment * alignment)
         if clamped_hit < h_prime:
             groups = reservations.truncate(groups, clamped_hit)
@@ -293,18 +293,18 @@ class LwdCloudScheduler(LwdBaseScheduler):
         pending = self._lwd_refill_pending.get(request_id)
         request = self.requests.get(request_id)
         current_nonce = getattr(request, "lwd_prefix_nonce", 0) if request else 0
-        if pending is None or prefix_nonce != pending.prefix_nonce or (
+        if pending is None or prefix_nonce != pending.prefix_nonce or (  # 【MR2】只接受 nonce 匹配的 refill_done；请求已换 nonce 或 pending 不存在时视为过期
             request is not None and current_nonce != pending.prefix_nonce
         ):
             lwd_logger.warning(
-                "[cloud-sched] stale refill_done req=%s nonce=%d ignored",
+                "[cloud-sched] stale refill_done req=%s nonce=%d ignored",  # 【MR2】过期的 refill_done 只告警并丢弃，不能解除门控
                 request_id,
                 prefix_nonce,
             )
             return
         self._lwd_refill_pending.pop(request_id)
         self._lwd_refill_gate.discard(request_id)
-        self.lwd_prefix_hits[request_id] = pending.hit_tokens
+        self.lwd_prefix_hits[request_id] = pending.hit_tokens  # 【MR2】解除门控后，把这次 refill 真正达成的命中数写回请求
         if request is not None:
             request.lwd_resume_cap_tokens = pending.hit_tokens
 
@@ -312,19 +312,19 @@ class LwdCloudScheduler(LwdBaseScheduler):
         windows: list[_LwdPrefillWindow] = []
         reservations = getattr(self, "lwd_prefix_reservations", None)
         prefix_enabled = getattr(self, "_lwd_prefix_enabled", False)
-        requests = list(
+        requests = list(  # 【MR2】把三类队列合成一个可遍历列表
             itertools.chain(self.running, self.waiting, self.skipped_waiting)
         )
-        grouped: dict[int, list[Request]] = {}
+        grouped: dict[int, list[Request]] = {}  # 【MR2】按请求 id 里的边前缀分组
         for request in requests:
-            edge_id, _ = parse_edge_id(request.request_id)
+            edge_id, _ = parse_edge_id(request.request_id)  # 【MR2】从 e{edge}- 前缀解析边编号
             grouped.setdefault(edge_id, []).append(request)
-        edge_ids = sorted(grouped)
+        edge_ids = sorted(grouped)  # 【MR2】边按编号排序，保证轮转顺序稳定
         if edge_ids:
-            start = self._lwd_prefill_group_cursor % len(edge_ids)
+            start = self._lwd_prefill_group_cursor % len(edge_ids)  # 【MR2】从游标位置开始轮转，游标每次只前移一位
             self._lwd_prefill_group_cursor = start + 1
-            edge_ids = edge_ids[start:] + edge_ids[:start]
-        ordered = itertools.chain.from_iterable(grouped[edge_id] for edge_id in edge_ids)
+            edge_ids = edge_ids[start:] + edge_ids[:start]  # 【MR2】旋转后的边顺序：本轮起点之后的边先排
+        ordered = itertools.chain.from_iterable(grouped[edge_id] for edge_id in edge_ids)  # 【MR2】按旋转后的边顺序展平请求，避免一条边长期占满预算
         for request in ordered:
             if room <= 0:
                 break
@@ -420,22 +420,22 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 positions = getattr(request, "lwd_mrope_positions", b"")
                 data.lwd_mrope_positions = b"" if positions is None else positions
 
-    @staticmethod
+    @staticmethod  # 【MR2】LWD 的 cache publication 只覆盖 prompt 块，不含输出占位
     def _lwd_cache_tokens(request: Request) -> int:
         """LWD cache publication covers prompt blocks only."""
         return request.num_computed_tokens - request.num_output_placeholders
 
-    def _update_request_with_output(
+    def _update_request_with_output(  # 【MR2】覆写原生更新逻辑：先走原生，再修正 LWD 的输出占位和 cache 发布
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         status_before_update = request.status
-        new_token_ids, stopped = _NativeScheduler._update_request_with_output(
+        new_token_ids, stopped = _NativeScheduler._update_request_with_output(  # 【MR2】直接复用原生 Scheduler._update_request_with_output
             self, request, new_token_ids
         )
-        if not is_stale:
+        if not is_stale:  # 【MR2】非 stale 结果要把新生成 token 从输出占位里扣掉
             request.num_output_placeholders -= len(new_token_ids)
-            assert request.num_output_placeholders >= 0
-        if status_before_update == RequestStatus.RUNNING:
+            assert request.num_output_placeholders >= 0  # 【MR2】占位计数不允许为负，兼作一致性断言
+        if status_before_update == RequestStatus.RUNNING:  # 【MR2】只有运行中的请求才把 prompt block 发布进 KV cache
             self.kv_cache_manager.cache_blocks(
                 request, self._lwd_cache_tokens(request)
             )
@@ -446,16 +446,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
         request_ids: str | Iterable[str] | None,
         finished_status: RequestStatus,
     ) -> list[Request]:
-        if request_ids is None:
+        if request_ids is None:  # 【MR2】request_ids 归一化：None 表示全部请求，str 包成单元素
             request_ids = list(self.requests)
         elif isinstance(request_ids, str):
             request_ids = (request_ids,)
         else:
             request_ids = tuple(request_ids)
-        for request_id in request_ids:
+        for request_id in request_ids:  # 【MR2】逐个请求补记完成快照
             request = self.requests.get(request_id)
             if request is not None:
-                self.lwd_finished_records[request_id] = (
+                self.lwd_finished_records[request_id] = (  # 【MR2】prompt 长度 + 输出 token 数，供引擎发布 usage 事件
                     request.num_prompt_tokens,
                     request.num_output_tokens,
                 )
@@ -516,17 +516,17 @@ class LwdCloudScheduler(LwdBaseScheduler):
             scheduler_output, model_runner_output
         )
         self._lwd_cleanup_arrivals(engine_core_outputs)
-        carriers = getattr(model_runner_output, "lwd_down_carriers", None)
+        carriers = getattr(model_runner_output, "lwd_down_carriers", None)  # 【MR2】多连接路径：每份 carrier 单独转成一条 C2E
         if carriers:
-            for carrier in carriers:
+            for carrier in carriers:  # 【MR2】遍历复数 carrier 列表
                 self._lwd_append_carrier_c2e(
-                    carrier[:4], engine_core_outputs, nonce_snapshot
+                    carrier[:4], engine_core_outputs, nonce_snapshot  # 【MR2】carrier[:4] 取 (hidden, req_ids, accepted, seqno)，尾部连接/缓冲字段在这里不用
                 )
-        else:
+        else:  # 【MR2】单连接兼容路径：没有复数列表时读单数字段
             carrier = getattr(model_runner_output, "lwd_down_carrier", None)
             if carrier is not None:
                 self._lwd_append_carrier_c2e(carrier, engine_core_outputs, nonce_snapshot)
-            elif LwdControlDiag.disable_down_enabled():
+            elif LwdControlDiag.disable_down_enabled():  # 【MR2】连 DOWN 都关闭时，用诊断 C2E 兜底，保证链路可跑通
                 self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
         return engine_core_outputs
 
@@ -536,8 +536,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
         for outputs in engine_core_outputs.values():
             for request_id in outputs.finished_requests or ():
                 self.lwd_recv_rows.pop(request_id, None)
-                self._lwd_refill_gate.discard(request_id)
-                self._lwd_refill_pending.pop(request_id, None)
+                self._lwd_refill_gate.discard(request_id)  # 【MR2】请求完成时同步清掉 refill 门控和等待项，避免状态泄漏
+                self._lwd_refill_pending.pop(request_id, None)  # 【MR2】refill 等待项也一起清理
                 self._lwd_dropped.discard(request_id)
 
     def _lwd_c2e_prefix_nonces(
@@ -592,13 +592,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
         rows = LwdControlDiag.disable_down_rows(engine_core_outputs)
         if not rows:
             return
-        rows_by_edge: dict[int, dict[str, list[int]]] = {}
+        rows_by_edge: dict[int, dict[str, list[int]]] = {}  # 【MR2】诊断模式的 DOWN 同样按边分组，避免多条边串包
         for request_id, token_ids in rows.items():
-            edge_id, _ = parse_edge_id(request_id)
+            edge_id, _ = parse_edge_id(request_id)  # 【MR2】从请求 id 解析边号
             rows_by_edge.setdefault(edge_id, {})[request_id] = token_ids
-        for edge_rows in rows_by_edge.values():
+        for edge_rows in rows_by_edge.values():  # 【MR2】每条边单独组一条 C2E
             request_ids = list(edge_rows)
-            self.pending_c2e.append(
+            self.pending_c2e.append(  # 【MR2】req_ids / token_ids / prefix_nonces 按下标一一对应
                 LwdC2eNotify(
                     hidden_num_elements=0,
                     top_id_ths=[],

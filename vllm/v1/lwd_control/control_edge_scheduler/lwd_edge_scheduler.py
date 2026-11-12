@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.config.lwd import LwdConnectionId
+from vllm.config.lwd import LwdConnectionId  # 【MR2】路由、账户、回包队列全部改用完整连接编号作 key
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import (
     LwdBatch,
@@ -70,8 +70,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.request import Request
 
-LwdSendToCloud = Callable[[LwdConnectionId, LwdEdgeToCloudMessage], None]
-"""Sends one message on a full edge -> cloud DP connection."""
+LwdSendToCloud = Callable[[LwdConnectionId, LwdEdgeToCloudMessage], None]  # 【MR2】发送函数签名改为（连接编号, 消息）
+"""Sends one message on a full edge -> cloud DP connection."""  # 【MR2】一条边可连多个云 DP，发送必须显式指定连接
 
 # Cloud finish code -> edge terminal state (frontend reason goes through the
 # output channel; ERROR maps to ABORTED)
@@ -110,31 +110,31 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # Injected by the engine once every cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self.lwd_refill_abort: Callable[[str], None] | None = None
-        self.lwd_on_finish: Callable[[Request], None] | None = None
-        self.lwd_on_tokens: Callable[[Request], None] | None = None
-        self.lwd_has_pending: Callable[[], bool] | None = None
-        self.lwd_refill_abort: Callable[[str], None] | None = None
-        self._lwd_pending_refills: deque[SchedulerOutput] = deque()
-        # One account per full connection: dp_idx alone is not unique when
+        self.lwd_on_finish: Callable[[Request], None] | None = None  # 【MR2】请求结束回调：引擎用来清理探测链等请求级状态
+        self.lwd_on_tokens: Callable[[Request], None] | None = None  # 【MR2】收到新 token 回调：用于更新请求侧记录
+        self.lwd_has_pending: Callable[[], bool] | None = None  # 【MR2】是否有待处理工作回调：探测/前缀控制未完成时阻止引擎休眠
+        self.lwd_refill_abort: Callable[[str], None] | None = None  # 【MR2】refill abort 回调（与上方第 112 行重复赋值，行为等价）
+        self._lwd_pending_refills: deque[SchedulerOutput] = deque()  # 【MR2】待发送的 refill 批次队列，优先级高于新的 EMBED
+        # One account per full connection: dp_idx alone is not unique when  # 【MR2】每个完整连接一个账户：多条边连多朵云时，裸 dp_idx 已不唯一
         # this edge connects to several clouds.
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
-        self._lwd_instance_id = lwd_config.instance_id
-        self._lwd_edge_share = (
+        self._lwd_instance_id = lwd_config.instance_id  # 【MR2】本边实例编号（edge_share 模式下用 client_index 代替）
+        self._lwd_edge_share = (  # 【MR2】edge_share：一个共享边进程服务多个逻辑前端
             lwd_config.topology.deployment.scene == "edge_share"
         )
-        connections = tuple(
+        connections = tuple(  # 【MR2】按连接编号排序，保证路由轮转顺序稳定
             sorted(c.connection_id for c in lwd_config.connections)
         )
-        self._lwd_connections = connections
-        self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {
+        self._lwd_connections = connections  # 【MR2】连接列表是路由、账户、门控的公共基准
+        self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {  # 【MR2】每个连接一份负载/序号账户，互不影响
             connection_id: LwdCloudDpAccount(connection_id)
             for connection_id in connections
         }
-        self._lwd_aborted_req_ids: dict[LwdConnectionId, list[str]] = {
+        self._lwd_aborted_req_ids: dict[LwdConnectionId, list[str]] = {  # 【MR2】每条连接独立的 abort 待发表
             connection_id: [] for connection_id in connections
         }
-        self._lwd_route: dict[str, LwdConnectionId] = {}
+        self._lwd_route: dict[str, LwdConnectionId] = {}  # 【MR2】请求 -> 连接 的路由表，准入时写入后不再改
         """Request id -> full connection, pinned at admission."""
         self._lwd_last_engine = -1
         """Round-robin anchor shared by routing and engine picking."""
@@ -146,7 +146,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # c2e notify queue: appended by the control-plane IO thread with the
         # delivering link's dp_idx, consumed within a scheduling step to
         # produce an UNEMBED batch
-        self.unembed_notify_queue: deque[
+        self.unembed_notify_queue: deque[  # 【MR2】UNEMBED 通知队列改为（连接, 消息），回包按连接区分
             tuple[LwdConnectionId, LwdC2eNotify]
         ] = deque()
         # Whole-prompt mrope positions for multimodal requests ([3,N] CPU
@@ -171,33 +171,33 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     # ------------------------------------------------------------- routing
 
-    def lwd_update_cloud_params(self, connection_id: LwdConnectionId, params) -> None:
+    def lwd_update_cloud_params(self, connection_id: LwdConnectionId, params) -> None:  # 【MR2】把某个云 DP 的参数应用到它自己的账户，不修改全局配置
         """Apply one cloud's HELLO parameters without mutating global config."""
-        account = self._lwd_accounts[connection_id]
-        account.num_speculative_tokens = max(0, params.num_speculative_tokens)
-        account.prefix_use_eagle = params.prefix_use_eagle
-        account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)
-        account.prefix_alignment_required = params.prefix_alignment_required
+        account = self._lwd_accounts[connection_id]  # 【MR2】按连接找到账户
+        account.num_speculative_tokens = max(0, params.num_speculative_tokens)  # 【MR2】投机 token 数：影响该连接的 decode 预算
+        account.prefix_use_eagle = params.prefix_use_eagle  # 【MR2】是否使用 EAGLE 前缀
+        account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)  # 【MR2】命中对齐粒度：prefill 分块要按它对齐
+        account.prefix_alignment_required = params.prefix_alignment_required  # 【MR2】云侧是否强制要求对齐
 
-    def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
+    def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:  # 【MR2】取请求已固定下来的路由连接
         """Routed dp_idx of an active request; unrouted ids are a bug."""
         return self._lwd_route[request_id]
 
-    def _lwd_dp_of_settling(self, request_id: str) -> LwdConnectionId | None:
+    def _lwd_dp_of_settling(self, request_id: str) -> LwdConnectionId | None:  # 【MR2】允许请求已结束时的迟到结果：查不到路由返回 None
         """Routed dp_idx, None for a request that already left the books
         (a late result racing its own finish)."""
         return self._lwd_route.get(request_id)
 
-    def _lwd_edge_id_of(self, request: Request) -> int:
+    def _lwd_edge_id_of(self, request: Request) -> int:  # 【MR2】请求归属的逻辑边编号
         """Logical edge id owning the request. In edge_share the shared edge
         engine serves every logical frontend, whose identity is the attach
         client_index; a standalone edge process owns exactly its
         instance_id."""
-        if self._lwd_edge_share:
+        if self._lwd_edge_share:  # 【MR2】edge_share 下前端身份是 client_index，否则就是本实例编号
             return request.client_index
         return self._lwd_instance_id
 
-    def _lwd_route_request(
+    def _lwd_route_request(  # 【MR2】选云并固定路由：只在属于该逻辑边的候选连接里选
         self, request_id: str, edge_id: int, preferred: LwdConnectionId | None = None
     ) -> LwdConnectionId:
         """Pick and pin the target connection for the requesting edge. Only
@@ -206,45 +206,45 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         request across every cloud); a healthy preferred route wins when
         supplied, otherwise score and ordered round-robin decide."""
         accounts = self._lwd_accounts
-        candidates = {
+        candidates = {  # 【MR2】候选连接 = 起点边编号等于请求归属边的连接
             connection_id: accounts[connection_id]
             for connection_id in self._lwd_connections
             if connection_id.edge_id == edge_id
         }
-        if not candidates:
+        if not candidates:  # 【MR2】没有任何可用连接属于配置错误，直接失败
             raise RuntimeError(
                 f"[LWD] no cloud connection for edge_id={edge_id} "
                 f"(request {request_id})"
             )
-        if preferred is not None and preferred in candidates:
+        if preferred is not None and preferred in candidates:  # 【MR2】探测给出的首选连接健康且在候选内，就直接用
             best = candidates[preferred]
-        elif len(candidates) == 1:
+        elif len(candidates) == 1:  # 【MR2】只有一个候选时无需打分
             best = next(iter(candidates.values()))
         else:
-            best = min(
+            best = min(  # 【MR2】多个候选：按分数最小选，分数相同按连接顺序轮转
                 candidates.values(),
                 key=lambda account: (
-                    account.score(),
+                    account.score(),  # 【MR2】账户分数 = 4 * prefill 负载 + decode 负载
                     (
-                        self._lwd_connections.index(account.connection_id)
+                        self._lwd_connections.index(account.connection_id)  # 【MR2】用连接在全局列表里的下标做轮转起点
                         - self._lwd_last_engine
                         - 1
                     )
                     % len(self._lwd_connections),
                 ),
             )
-        connection_id = best.connection_id
-        self._lwd_route[request_id] = connection_id
-        best.note_prefill_admitted(request_id)
+        connection_id = best.connection_id  # 【MR2】选中的连接编号
+        self._lwd_route[request_id] = connection_id  # 【MR2】写入路由表：后续分片、abort、回包都走这条连接
+        best.note_prefill_admitted(request_id)  # 【MR2】把请求计入该连接的 prefill 负载
         lwd_logger.info(
-            "[edge-route] req=%s edge=%d -> %s (score=%d loads=%s)",
+            "[edge-route] req=%s edge=%d -> %s (score=%d loads=%s)",  # 【MR2】路由日志：请求、逻辑边、连接、分数、各连接负载
             request_id,
-            edge_id,
-            connection_id,
+            edge_id,  # 【MR2】打印逻辑边编号
+            connection_id,  # 【MR2】打印选中的连接
             best.score(),
-            [(a.prefill_load, a.decode_load) for a in accounts.values()],
+            [(a.prefill_load, a.decode_load) for a in accounts.values()],  # 【MR2】打印所有连接的负载，便于复盘打分
         )
-        return connection_id
+        return connection_id  # 【MR2】返回固定下来的路由
 
     def _lwd_account_of(self, request_id: str) -> LwdCloudDpAccount | None:
         dp_idx = self._lwd_dp_of_settling(request_id)
@@ -264,10 +264,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """
         return (
             bool(self.unembed_notify_queue)
-            or bool(self._lwd_pending_refills)
-            or (self.lwd_has_pending is not None and self.lwd_has_pending())
+            or bool(self._lwd_pending_refills)  # 【MR2】有待发 refill 也算有工作
+            or (self.lwd_has_pending is not None and self.lwd_has_pending())  # 【MR2】探测/前缀控制未完成时不能提前退出
             or any(self._lwd_aborted_req_ids.values())
-            or any(account.pending_chunks() for account in self._lwd_accounts.values())
+            or any(account.pending_chunks() for account in self._lwd_accounts.values())  # 【MR2】任一连接还有未完成的发送批次也算有工作
             or self._lwd_embed_dispatchable()
         )
 
@@ -284,26 +284,26 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return out
         return self._lwd_schedule_unembed()
 
-    def _lwd_pick_serving_engine(self) -> LwdConnectionId | None:
+    def _lwd_pick_serving_engine(self) -> LwdConnectionId | None:  # 【MR2】选择一个未门控且有路由请求的连接来服务
         """Pick the next ungated connection with routed work in stable order."""
-        routed = set(self._lwd_route.values())
+        routed = set(self._lwd_route.values())  # 【MR2】只考虑当前有请求路由过去的连接
         if not routed:
             return None
-        connections = self._lwd_connections
+        connections = self._lwd_connections  # 【MR2】按稳定顺序从上次服务位置的下一个开始扫描
         for offset in range(len(connections)):
-            index = (self._lwd_last_engine + 1 + offset) % len(connections)
+            index = (self._lwd_last_engine + 1 + offset) % len(connections)  # 【MR2】环形扫描所有连接
             connection_id = connections[index]
             if connection_id not in routed:
                 continue
-            account = self._lwd_accounts[connection_id]
+            account = self._lwd_accounts[connection_id]  # 【MR2】取该连接的账户
             if account.is_gated(
                 self.max_num_running_reqs,
-                self._lwd_has_prefill_chunk_inflight(connection_id),
+                self._lwd_has_prefill_chunk_inflight(connection_id),  # 【MR2】有 resume 在飞时不门控该连接（先把手上的块发完）
             ):
                 self._lwd_log_gate_transition(account)
                 continue
-            self._lwd_last_engine = index
-            return connection_id
+            self._lwd_last_engine = index  # 【MR2】记录轮转位置，下次从这里继续
+            return connection_id  # 【MR2】返回选中的连接
         return None
 
     def _lwd_log_gate_transition(self, account: LwdCloudDpAccount) -> None:
@@ -311,9 +311,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if held != account.gate_held:
             account.gate_held = held
             lwd_logger.info(
-                "[edge-sched] prefill gate %s: %s pending_chunks=%d",
+                "[edge-sched] prefill gate %s: %s pending_chunks=%d",  # 【MR2】门控状态变化日志
                 "HOLD" if held else "OPEN",
-                account.connection_id,
+                account.connection_id,  # 【MR2】日志里带连接编号和待发块数
                 account.pending_chunks(),
             )
 
@@ -350,7 +350,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 seqno=-1,
                 batch_meta=LwdEmbedBatch(
                     aborted_req_ids=request_ids,
-                    connection_id=dp_idx,
+                    connection_id=dp_idx,  # 【MR2】abort 批次也带上连接编号
                 ),
             )
             self._lwd_aborted_req_ids[dp_idx] = []
@@ -375,9 +375,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         consume send watermarks."""
         watermarks = getattr(model_runner_output, "lwd_up_send_watermarks", {})
         for dp_idx, watermark in watermarks.items():
-            if isinstance(dp_idx, int):
+            if isinstance(dp_idx, int):  # 【MR2】兼容旧 producer：发送水位 key 仍可能是 int 下标
                 # Legacy single-cloud worker/test producers used link indices.
-                dp_idx = self._lwd_connections[dp_idx]
+                dp_idx = self._lwd_connections[dp_idx]  # 【MR2】把旧下标翻译成连接编号
             self._lwd_accounts[dp_idx].note_send_watermark(watermark)
             self._lwd_announced_refills = {
                 key
@@ -385,8 +385,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 if key[0] != dp_idx or key[1] > watermark
             }
         batch = getattr(scheduler_output, "lwd_batch", None)
-        outputs: dict[int, list[EngineCoreOutput]] = {}
-        finished: dict[int, set[str]] = {}
+        outputs: dict[int, list[EngineCoreOutput]] = {}  # 【MR2】输出按 client_index 分组（多条边各自收自己的结果）
+        finished: dict[int, set[str]] = {}  # 【MR2】完成请求也按 client_index 分组
         if batch is not None and batch.batch_type == LwdBatchType.LWD_UNEMBED:
             notify = scheduler_output.lwd_c2e_notify[0]
             req_ids = getattr(model_runner_output, "req_ids", None) or ()
@@ -407,11 +407,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if not outputs:
             return {}
         return {
-            client_index: EngineCoreOutputs(
+            client_index: EngineCoreOutputs(  # 【MR2】每个逻辑边一份 EngineCoreOutputs
                 outputs=outs,
-                finished_requests=finished.get(client_index) or None,
+                finished_requests=finished.get(client_index) or None,  # 【MR2】只把该 client 的完成请求放进它自己那份
             )
-            for client_index, outs in outputs.items()
+            for client_index, outs in outputs.items()  # 【MR2】逐个 client 组装
         }
 
     @staticmethod
@@ -441,16 +441,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, sampled_token_map: dict[str, list[int]]
-    ) -> tuple[dict[int, list[EngineCoreOutput]], dict[int, set[str]]]:
+    ) -> tuple[dict[int, list[EngineCoreOutput]], dict[int, set[str]]]:  # 【MR2】解包返回值扩展为（输出, 完成请求）两份按 client 分组的表
         """Per-request delivery: row disposition goes through
         _lwd_row_disposition (zero-accepted live rows are skipped; ERROR
         only when accepted>0 yet token missing); late results not in
         awaiting are idempotently dropped.
 
         Results are grouped by ``request.client_index`` so each logical edge
-        receives only its own outputs (edge0->client 0, edge2->client 2)."""
-        outputs: dict[int, list[EngineCoreOutput]] = {}
-        finished: dict[int, set[str]] = {}
+        receives only its own outputs (edge0->client 0, edge2->client 2)."""  # 【MR2】补充：结果按 request.client_index 分组，各逻辑边只收自己的输出
+        outputs: dict[int, list[EngineCoreOutput]] = {}  # 【MR2】每个逻辑边独立的输出表
+        finished: dict[int, set[str]] = {}  # 【MR2】每个逻辑边独立的完成请求表
         # accepted is position-aligned with rows (same contract as
         # lwd_build_unembed_batch); the DISABLE_DOWN bypass carries no
         # accepted, so token presence/absence is used instead
@@ -512,13 +512,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 continue
-            request = self.requests[request_id]
-            client_index = getattr(request, "client_index", 0)
-            if sampled_token_ids:
+            request = self.requests[request_id]  # 【MR2】取请求对象，读它的 client_index
+            client_index = getattr(request, "client_index", 0)  # 【MR2】请求归属的逻辑边（默认 0）
+            if sampled_token_ids:  # 【MR2】有采样 token 时先写回请求
                 request.append_output_token_ids(sampled_token_ids)
-                if self.lwd_on_tokens is not None:
+                if self.lwd_on_tokens is not None:  # 【MR2】通知引擎：该请求有新 token
                     self.lwd_on_tokens(request)
-            if finished_now and self.lwd_on_finish is not None:
+            if finished_now and self.lwd_on_finish is not None:  # 【MR2】请求已结束：通知引擎做清理
                 self.lwd_on_finish(request)
             if finished_now:
                 # The ground truth of the cloud's stop decision lands here:
@@ -537,7 +537,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         finish_reason, RequestStatus.FINISHED_STOPPED
                     ),
                 )
-            outputs.setdefault(client_index, []).append(
+            outputs.setdefault(client_index, []).append(  # 【MR2】输出按 client 分桶
                 EngineCoreOutput(
                     request_id,
                     sampled_token_ids,
@@ -545,7 +545,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
             )
             if finished_now:
-                finished.setdefault(client_index, set()).add(request_id)
+                finished.setdefault(client_index, set()).add(request_id)  # 【MR2】完成请求按 client 分桶
         return outputs, finished
 
     @staticmethod
@@ -556,27 +556,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         code = notify.finish_reasons[index]
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
-    @staticmethod
+    @staticmethod  # 【MR2】结构化输出语法尚未编译好的请求，先不要放进原生可见集合
     def _lwd_grammar_ready(request: Request) -> bool:
         """Keep grammar-compiling requests out of the native visible set."""
-        if request.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+        if request.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:  # 【MR2】只拦截“等待语法编译”状态的请求
             return True
-        structured = request.structured_output_request
-        return bool(structured and structured.grammar)
+        structured = request.structured_output_request  # 【MR2】取结构化输出请求
+        return bool(structured and structured.grammar)  # 【MR2】语法已存在就放行
 
     def _lwd_pick_prefill_batch(
-        self, dp_idx: LwdConnectionId
+        self, dp_idx: LwdConnectionId  # 【MR2】prefill 挑选按连接维度进行
     ) -> tuple[list[str], dict[str, int], int]:
         """Picker adapter layer: candidates routed to dp_idx, cap and
-        free_seq from that engine's account."""
-        account = self._lwd_accounts[dp_idx]
-        inflight = account.load
-        cap = max(
+        free_seq from that engine's account."""  # 【MR2】预算与空位都取自该连接自己的账户（不是全局 dp_idx）
+        account = self._lwd_accounts[dp_idx]  # 【MR2】预算和空位都来自该连接自己的账户
+        inflight = account.load  # 【MR2】该连接当前的运行中请求数
+        cap = max(  # 【MR2】token 预算要扣掉 decode 预留
             0,
             self.max_num_scheduled_tokens
-            - account.decode_load * account.num_speculative_tokens,
+            - account.decode_load * account.num_speculative_tokens,  # 【MR2】decode 请求按投机 token 数预留预算
         )
-        free_seq = self.max_num_running_reqs - inflight
+        free_seq = self.max_num_running_reqs - inflight  # 【MR2】剩余请求槽数按该连接的负载算
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
         # after the filter, a non-empty candidate list is itself the resume
@@ -595,23 +595,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             for r in [*self.skipped_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
-            and self._lwd_grammar_ready(r)
+            and self._lwd_grammar_ready(r)  # 【MR2】跳过语法还没编译好的请求
         ]
         req_ids, expected = lwd_pick_prefill_batch(
             running,
             waiting,
             cap=cap,
             free_seq=free_seq,
-            chunk_unit=(
+            chunk_unit=(  # 【MR2】分块粒度：云侧强制对齐时用前缀对齐粒度
                 account.prefix_alignment_tokens
                 if account.prefix_alignment_required
                 and account.prefix_alignment_tokens > 0
                 else self._lwd_chunk_unit
-            ),
+            ),  # 【MR2】否则用全局 chunk_unit
         )
         return req_ids, expected, cap
 
-    def _lwd_schedule_batch(self, dp_idx: LwdConnectionId) -> SchedulerOutput:
+    def _lwd_schedule_batch(self, dp_idx: LwdConnectionId) -> SchedulerOutput:  # 【MR2】为指定连接组装调度批次
         """Chunk batch assembly: the picker selects the batch of one engine,
         scheduled via the base-class visible-set mechanism (budget clamped
         to that engine's cap; the chunk split is guaranteed by the clamping
@@ -632,7 +632,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         contract, so nothing is scheduled, consumed, or rolled back."""
         return [], num_new_tokens, encoder_compute_budget, []
 
-    def _lwd_has_prefill_chunk_inflight(self, dp_idx: LwdConnectionId) -> bool:
+    def _lwd_has_prefill_chunk_inflight(self, dp_idx: LwdConnectionId) -> bool:  # 【MR2】判断该连接是否有还没发完的 EMBED 块（决定 resume 是否豁免门控）
         """Whether dp_idx has an embed request not fully sent; same
         criterion as the picker resume branch -- the two must stay
         consistent (the gate lets a resume finish before new work)."""
@@ -648,12 +648,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return True
         announced = getattr(self, "_lwd_announced_refills", set())
         return any(
-            (account.connection_id, seqno) in announced and request_id in request_ids
+            (account.connection_id, seqno) in announced and request_id in request_ids  # 【MR2】“已公告 refill”键改为（连接, seqno）
             for account in self._lwd_accounts.values()
             for seqno, request_ids in account.pending_batches.items()
         )
 
-    def lwd_admit_request(
+    def lwd_admit_request(  # 【MR2】准入：校验、算 mrope、选路，返回固定下来的连接
         self, request: Request, preferred: LwdConnectionId | None = None
     ) -> LwdConnectionId:
         """Scheduler-local half of request admission: mode boundary
@@ -663,7 +663,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         engine path (the ledger is pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
-        return self._lwd_route_request(
+        return self._lwd_route_request(  # 【MR2】路由时带上探测给的首选连接
             request.request_id, self._lwd_edge_id_of(request), preferred
         )
 
@@ -747,7 +747,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return positions.contiguous().numpy().tobytes()
 
     def lwd_edge_notify_range(
-        self, dp_idx: LwdConnectionId, scheduler_output: SchedulerOutput
+        self, dp_idx: LwdConnectionId, scheduler_output: SchedulerOutput  # 【MR2】RangeNotify 按连接发送
     ) -> None:
         """Send one batch RangeNotify of dp_idx and attach the EMBED batch;
         a seqno of that engine is only taken by a notify that was sent."""
@@ -759,7 +759,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         seqno = account.take_seqno()
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
         lwd_logger.info(
-            "[edge] range announced %s seqno=%d reqs=%d tokens=%d",
+            "[edge] range announced %s seqno=%d reqs=%d tokens=%d",  # 【MR2】日志带连接编号
             dp_idx,
             seqno,
             len(items),
@@ -781,7 +781,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 token_ids=token_slices,
                 prompt_offsets=prompt_offsets,
                 has_mrope=has_mrope,
-                connection_id=dp_idx,
+                connection_id=dp_idx,  # 【MR2】EMBED 批次带连接编号，worker 据此选通道
                 aborted_req_ids=aborted_req_ids,
             ),
         )
@@ -838,7 +838,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 token_ids=[list(request.prompt_token_ids[chunk_start:chunk_end])],
                 prompt_offsets=[chunk_start],
                 has_mrope=[False],
-                connection_id=dp_idx,
+                connection_id=dp_idx,  # 【MR2】refill 批次同样带连接编号
             )
             batch_meta.is_refill = True
             batch_meta.lwd_prefix_nonce = prefix_nonce
@@ -860,13 +860,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         assert batch is not None and batch.batch_meta is not None
         meta = batch.batch_meta
         request_id = meta.req_ids[0]
-        connection = meta.connection_id
+        connection = meta.connection_id  # 【MR2】refill 用批次自带的连接编号，不从全局猜
         request = self.requests.get(request_id)
         prefix_nonce = getattr(meta, "lwd_prefix_nonce", 0)
         if (
             request is None
             or getattr(request, "lwd_prefix_nonce", 0) != prefix_nonce
-            or self._lwd_dp_of_settling(request_id) != connection
+            or self._lwd_dp_of_settling(request_id) != connection  # 【MR2】路由已经变化或请求已结束时，丢弃这次 refill
         ):
             lwd_logger.warning(
                 "[edge-refill] drop stale queued chunk req=%s nonce=%d",
@@ -883,11 +883,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             is_refill=True,
             prefix_nonce=prefix_nonce,
         )
-        account = self._lwd_accounts[connection]
+        account = self._lwd_accounts[connection]  # 【MR2】取该连接的账户发 refill
         seqno = account.seqno
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
         try:
-            self.lwd_send_to_cloud(
+            self.lwd_send_to_cloud(  # 【MR2】按连接发送 refill 的 RangeNotify
                 connection, LwdRangeNotify(seqno=seqno, items=[item])
             )
         except Exception:
@@ -898,7 +898,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return SchedulerOutput.make_empty()
         account.take_seqno()
         account.register_batch(seqno, {request_id})
-        self._lwd_announced_refills.add((connection, seqno))
+        self._lwd_announced_refills.add((connection, seqno))  # 【MR2】记录已公告的 refill 键（连接, seqno）
         batch.seqno = seqno
         return scheduler_output
 
@@ -943,7 +943,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             (items, req_ids, token_slices, prompt_offsets, has_mrope) if items else None
         )
 
-    def lwd_edge_abort(
+    def lwd_edge_abort(  # 【MR2】abort 返回（连接, 请求）列表，由引擎按连接发通知
         self, request_ids: list[str]
     ) -> list[tuple[LwdConnectionId, str]]:
         """Settle aborted requests and return their original DP routes."""
@@ -1021,7 +1021,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Mode boundary validation (edge capability surface): reject
         client-provided prompt_embeds/pooling/structured output/sampling
         params not carried on the wire; violations raise ValueError and are
-        rejected before enqueueing."""
+        rejected before enqueueing."""  # 【MR2】校验点在入队前，失败不会留下半初始化状态  # 【MR2】边界校验在入队前完成，违规直接 ValueError，不留半初始化状态
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
@@ -1081,9 +1081,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
 
 
-def lwd_build_unembed_batch(
+def lwd_build_unembed_batch(  # 【MR2】组装 UNEMBED 批次：云端结果绕过原生调度，直接回边侧
     dp_idx: LwdConnectionId, notify: LwdC2eNotify
-) -> SchedulerOutput:
+) -> SchedulerOutput:  # 【MR2】批次按连接构造
     """Assemble the UNEMBED batch: cloud results bypass native scheduling;
     use make_empty as the skeleton and attach LwdUnembedBatch of dp_idx."""
     scheduler_output = SchedulerOutput.make_empty()
@@ -1101,7 +1101,7 @@ def lwd_build_unembed_batch(
             out_token_idxs=[],
             top_id_ths=list(notify.top_id_ths),
             token_ids=[list(t) for t in notify.token_ids],
-            connection_id=dp_idx,
+            connection_id=dp_idx,  # 【MR2】UNEMBED 批次带连接编号
         ),
     )
     scheduler_output.lwd_c2e_notify = [notify]
