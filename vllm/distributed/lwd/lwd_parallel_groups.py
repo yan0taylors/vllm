@@ -7,13 +7,12 @@ Design: docs/design/lwd_data_plane.md.
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.config.lwd import LwdTopology
+    from vllm.config.lwd import LwdConnectionId, LwdTopology
 
 LwdRankGroup = tuple[int, ...]
 
@@ -22,7 +21,7 @@ LwdRankGroup = tuple[int, ...]
 class LwdChannelEndpoints:
     """Global ranks that hold the data-plane channels of one DP connection."""
 
-    dp_idx: int
+    connection_id: LwdConnectionId
     edge_rank: int
     cloud_rank: int
 
@@ -63,25 +62,19 @@ class LwdParallelGroupsSpec:
         """Derive the groups, or raise before any process creates one.
 
         Raises:
-            NotImplementedError: Instances share a rank allocation, or a
-                rank holds the channels of several DP connections, outside
-                single_instance.
             ValueError: Allocations of distinct instances or DPs overlap.
         """
         scene = topology.deployment.scene
         # 1. One allocation per edge instance (its DPs share its ranks: one
         # process serves them all) and one per cloud DP (one engine each).
-        edge_allocations = [edge.dp[0].ranks for edge in topology.edges]
+        # edge_share has several logical frontend IDs but exactly one edge
+        # engine/allocation. Only that engine joins the shared world; its
+        # attach-only API processes do not create parallel groups.
+        edge_instances = (
+            topology.edges[:1] if scene == "edge_share" else topology.edges
+        )
+        edge_allocations = [edge.dp[0].ranks for edge in edge_instances]
         cloud_allocations = [dp.ranks for cloud in topology.clouds for dp in cloud.dp]
-        if scene != "single_instance" and len(set(edge_allocations)) != len(
-            edge_allocations
-        ):
-            # TODO(lwd): host shared edge ranks once each DP connection gets
-            # its own communication domain instead of one shared world.
-            raise NotImplementedError(
-                "[LWD] edge instances sharing ranks cannot run in one shared "
-                f"HCCL world (scene={scene}): one rank is one process"
-            )
         seen: set[int] = set()
         for allocation in (*edge_allocations, *cloud_allocations):
             if seen.intersection(allocation):
@@ -90,9 +83,12 @@ class LwdParallelGroupsSpec:
                     f"overlapping ranks {sorted(seen.intersection(allocation))}"
                 )
             seen.update(allocation)
-        # 2. Endpoints are the first ranks; the cloud one broadcasts to its
-        # TP group. In single_instance the edge process serves every DP
-        # connection, so its endpoint rank holds several channels by design.
+        # 2. The edge endpoint is the first rank of its instance. The cloud
+        # endpoint rotates across the DP's ranks by edge id, so connections
+        # from several edges do not all land on the DP leader; the endpoint
+        # then broadcasts its payload within the DP's TP group. In
+        # single_instance the edge process serves every DP connection, so its
+        # endpoint rank holds several channels by design.
         connections = [
             connection
             for edge in topology.edges
@@ -101,35 +97,21 @@ class LwdParallelGroupsSpec:
         channel_endpoints = sorted(
             (
                 LwdChannelEndpoints(
-                    connection.dp_idx,
+                    connection.connection_id,
                     connection.edge.ranks[0],
-                    connection.cloud_leader_rank,
+                    connection.cloud.ranks[
+                        connection.edge_id % len(connection.cloud.ranks)
+                    ],
                 )
                 for connection in connections
             ),
             key=lambda endpoints: (endpoints.edge_rank, endpoints.cloud_rank),
         )
-        if scene != "single_instance":
-            endpoint_uses = Counter(
-                rank
-                for endpoints in channel_endpoints
-                for rank in (endpoints.edge_rank, endpoints.cloud_rank)
-            )
-            overloaded = sorted(
-                rank for rank, uses in endpoint_uses.items() if uses > 1
-            )
-            if overloaded:
-                # TODO(lwd): key the data-plane channels by DP connection.
-                raise NotImplementedError(
-                    f"[LWD] ranks {overloaded} hold the channels of several DP "
-                    "connections; the data plane supports one per rank "
-                    f"(scene={scene})"
-                )
         # 3. Co-located DP groups: one per cloud-instance position, holding
         # that position's rank of every DP of the instance (all DPs split
         # the instance ranks equally); edge ranks are singletons.
         dp_groups: list[LwdRankGroup] = [
-            (rank,) for edge in topology.edges for rank in edge.dp[0].ranks
+            (rank,) for edge in edge_instances for rank in edge.dp[0].ranks
         ]
         dp_groups += [
             tuple(dp.ranks[position] for dp in cloud.dp)
@@ -139,7 +121,7 @@ class LwdParallelGroupsSpec:
         # 4. EP groups: experts sharded dp x tp over each cloud instance, as
         # natively; the edge holds no experts but joins a group so every
         # rank is covered.
-        ep_groups: list[LwdRankGroup] = [edge.dp[0].ranks for edge in topology.edges]
+        ep_groups: list[LwdRankGroup] = [edge.dp[0].ranks for edge in edge_instances]
         ep_groups += [
             tuple(rank for dp in cloud.dp for rank in dp.ranks)
             for cloud in topology.clouds

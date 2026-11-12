@@ -43,7 +43,21 @@ class LwdConfig:
             )
         entry = TypeAdapter(_LwdEntry).validate_python(raw)
         path, role, identity = entry["path"], entry["role"], entry["instance_id"]
-        topology = LwdTopology.from_file(path)
+        return cls.from_topology(
+            path, role, identity, LwdTopology.from_file(path), api=api
+        )
+
+    @classmethod
+    def from_topology(
+        cls,
+        path: str,
+        role: str,
+        identity: int,
+        topology: LwdTopology,
+        *,
+        api: LwdAPIConfig | None = None,
+    ) -> "LwdConfig":
+        """Build an entry around an already parsed in-memory topology."""
         topology.instance(role, identity)
         coordination = None
         # coordination is embedded in each instance, not at the top level.
@@ -55,6 +69,14 @@ class LwdConfig:
                 cloud_id=identity if role == "cloud" else None,
             )
             coordination.validate_role(role)
+            unknown_clouds = set(coordination.control_url_map) - {
+                cloud.id for cloud in topology.clouds
+            }
+            if unknown_clouds:
+                raise ValueError(
+                    f"[LWD] control_url_map references unknown clouds "
+                    f"{sorted(unknown_clouds)}"
+                )
         return cls(
             path,
             role,
@@ -64,10 +86,38 @@ class LwdConfig:
             api=api if api is not None else LwdAPIConfig(),
         )
 
+    def validate_prefix_caching(self, enabled: bool) -> None:
+        """Require one explicit HTTP coordination path for prefix caching."""
+        if not enabled:
+            return
+        if self.coordination is None or not self.coordination.enabled:
+            raise ValueError(
+                "[LWD] prefix caching requires enabled HTTP coordination "
+                "on both edge and cloud"
+            )
+        self.coordination.validate_role(self.role)
+
+    def skips_module(self, path: str) -> bool:
+        """Whether this role replaces a model component with a placeholder."""
+        if self.role == "edge":
+            return path == "model.norm" or path.endswith(".model.norm")
+        if self.role == "cloud":
+            return path == "visual" or path.endswith(".visual")
+        return False
+
     @property
     def instance(self) -> LwdInstance:
         return self.topology.instance(self.role, self.instance_id)
 
     @property
     def connections(self) -> tuple[LwdDPConnection, ...]:
+        if self.role == "edge" and self.topology.deployment.scene == "edge_share":
+            # All logical frontends share this one physical engine. It owns
+            # every logical edge -> cloud connection, while attach-only API
+            # processes never create a second engine or HCCL world.
+            return tuple(
+                connection
+                for edge in self.topology.edges
+                for connection in self.topology.connections("edge", edge.id)
+            )
         return self.topology.connections(self.role, self.instance_id)
