@@ -10,18 +10,11 @@ Fields may only be appended with defaults. Any other change bumps
 `LWD_MESSAGE_VERSION`, which the link handshake checks on both sides.
 """
 
-import dataclasses
-import json
-from typing import Any, TypeAlias, TypeVar, cast
+from typing import TypeAlias
 
 import msgspec
 
-T = TypeVar("T")
-
-# 4: LwdRequestNotify gained `structured_outputs`. An old cloud would drop
-# the constraint silently (msgspec skips unknown fields on decode), so mixed
-# versions fail the handshake instead of serving unstructured output.
-LWD_MESSAGE_VERSION = 4
+LWD_MESSAGE_VERSION = 5
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
@@ -89,62 +82,22 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     mrope_positions: bytes = b""
     """Contiguous int64 [3, num_prompt_tokens] M-RoPE positions of the full
     prompt; empty when unused."""
+    prefix_hit_tokens: int = 0
+    """Exact prefix boundary trimmed by the edge after its gateway probe.
+
+    Native nonce negotiation ignores this field and uses its reservation. The
+    gateway path must consume the same snapshot at this boundary (or discard a
+    stale reservation for a fail-open zero hit), never renegotiate the hit.
+    """
+    prefix_probe_succeeded: bool = False
+    """Whether a gateway probe completed and created the matching reservation.
+
+    False also covers placement-only and fail-open. Keeping this separate from
+    a zero hit preserves the HMAC manifest/finish chain of successful cache
+    misses while allowing fail-open requests to discard stale reservations.
+    """
     structured_outputs: str = ""
-    """`lwd_encode_structured_outputs` wire JSON of the validated
-    `StructuredOutputsParams`; empty for a plain request. The cloud rebuilds
-    the params, compiles the grammar and applies the sampling bitmask; the
-    edge compiles its own copy only for the picker's grammar-ready filter."""
-
-
-def lwd_encode_structured_outputs(params: Any) -> str:
-    """JSON wire form of a validated `StructuredOutputsParams`.
-
-    The private fields (`_backend*`, `init=False`) never ride the field
-    dict: `params_cls(**fields)` rejects them as constructor keywords, so the
-    edge-chosen backend travels next to the fields in the envelope and is
-    re-attached after decode. This is the single implementation shared by the
-    edge packer and the cloud rebuild.
-    """
-    data = dataclasses.asdict(params)
-    backend = data.pop("_backend", None)
-    data.pop("_backend_was_auto", None)
-    return json.dumps({"fields": data, "backend": backend})
-
-
-def lwd_decode_structured_outputs(payload: str, params_cls: type[T]) -> T | None:
-    """Rebuild the constraint params from the wire JSON; None if plain.
-
-    Args:
-        payload: The `LwdRequestNotify.structured_outputs` string.
-        params_cls: The dataclass to rebuild (its public, `init=True` fields
-            must match the envelope's `fields` dict).
-
-    Returns:
-        The rebuilt params with `_backend` re-attached, or None when the
-        payload is the plain-request empty string.
-
-    Raises:
-        ValueError: The payload is not a well-formed envelope.
-    """
-    if not payload:
-        return None
-    try:
-        envelope = json.loads(payload)
-        fields = envelope["fields"]
-        backend = envelope["backend"]
-        if not isinstance(fields, dict):
-            raise TypeError(f"fields must be a dict, got {type(fields).__name__}")
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise ValueError(f"malformed structured_outputs payload {payload!r}") from exc
-    try:
-        params = params_cls(**fields)
-    except TypeError as exc:
-        raise ValueError(
-            f"structured_outputs fields do not fit {params_cls}: {exc}"
-        ) from exc
-    # init=False private field: cannot ride the constructor, reattach here.
-    cast(Any, params)._backend = backend
-    return params
+    """JSON-serialized StructuredOutputsParams, including the validated backend."""
 
 
 LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
@@ -175,6 +128,24 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     """Generation to abort; zero is the legacy form."""
 
 
+class LwdGenChainNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Edge -> cloud. Full prompt+generated hash chain; replaces prior chains."""
+
+    request_id: str
+    block_hashes: list[bytes] = []
+    block_size: int = 0
+
+
+class LwdFinishNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Edge -> cloud. Final full chain, usage counters and publish decision."""
+
+    request_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    full_block_hashes: list[bytes] = []
+    publish_cache: bool = True
+
+
 class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """Cloud -> edge. Scheduling limits both sides must agree on.
 
@@ -195,6 +166,7 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     prefix_alignment_tokens: int = 0
     prefix_alignment_required: bool = False
     prefix_use_eagle: bool = False
+    prefix_hash_block_size: int = 0
 
 
 class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -240,7 +212,13 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     """Generation of each request row, aligned with req_ids."""
 
 
-LwdEdgeToCloudMessage: TypeAlias = LwdRequestNotify | LwdRangeNotify | LwdAbortNotify
+LwdEdgeToCloudMessage: TypeAlias = (
+    LwdRequestNotify
+    | LwdRangeNotify
+    | LwdAbortNotify
+    | LwdGenChainNotify
+    | LwdFinishNotify
+)
 LwdCloudToEdgeMessage: TypeAlias = (
     LwdCloudParamsNotify | LwdC2eNotify | LwdPrefixReadyNotify | LwdRefillNotify
 )
