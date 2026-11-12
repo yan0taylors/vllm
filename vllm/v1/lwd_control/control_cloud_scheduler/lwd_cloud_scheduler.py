@@ -26,6 +26,7 @@ from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
     LwdEmbedBatch,
+    LwdRequestMetadata,
     SchedulerOutput,
 )
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
@@ -83,6 +84,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.lwd_recv_rows: dict[str, int] = {}
+        # Absolute-prompt reports stay in lwd_recv_rows for MR1 compatibility.
+        # Wire-relative reports carry their own resume_base and use these two
+        # ledgers; coverage always remains a prompt-absolute high watermark.
+        self.lwd_wire_rows: dict[str, int] = {}
+        self.lwd_resume_bases: dict[str, int] = {}
+        self._lwd_runner_resume_bases: dict[str, int] = {}
+        self._lwd_prefill_starts: dict[str, int] = {}
         self._lwd_dropped: set[str] = set()
         self._lwd_abort_pending: list[str] = []
         self._lwd_prefix_enabled = bool(
@@ -111,6 +119,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             self._lwd_verify_w2(out, windows, decode_exact)
             self._lwd_warn_under_scheduled(out, windows)
         self._lwd_attach_mrope_positions(out)
+        self._lwd_attach_worker_metadata(out, windows)
         self._lwd_attach_abort_notice(out)
         return out
 
@@ -152,6 +161,56 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         return decode_exact
 
+    def lwd_note_arrival(
+        self,
+        request_id: str,
+        rows: int,
+        *,
+        resume_base: int | None = None,
+    ) -> None:
+        """Merge one cumulative arrival without mixing coordinate systems.
+
+        MR1 reports are ``(request_id, prompt_rows)`` and pass no resume base.
+        MR2 may report ``(request_id, wire_rows, resume_base)``: only the wire
+        rows after the locally cached prefix are counted by the second value.
+        Both forms update one absolute high watermark; they are never added
+        together. The explicit base also lets a refill rebase later reports.
+        """
+        rows = int(rows)
+        if rows < 0 or (resume_base is not None and resume_base < 0):
+            raise ValueError(f"[LWD] invalid arrival for {request_id}")
+        recv_rows = getattr(self, "lwd_recv_rows", {})
+        previous = recv_rows.get(request_id, 0)
+        if resume_base is None:
+            recv_rows[request_id] = max(previous, rows)
+            return
+        wire_rows = getattr(self, "lwd_wire_rows", None)
+        resume_bases = getattr(self, "lwd_resume_bases", None)
+        if wire_rows is None or resume_bases is None:
+            raise RuntimeError("[LWD] wire-relative arrival ledger is not initialized")
+        if resume_bases.get(request_id) == resume_base:
+            rows = max(rows, wire_rows.get(request_id, 0))
+        resume_bases[request_id] = resume_base
+        wire_rows[request_id] = rows
+        recv_rows[request_id] = max(previous, resume_base + rows)
+
+    def _lwd_arrival_coverage(self, request: Request) -> int:
+        """Return the contiguous arrived prefix in absolute prompt coordinates."""
+        request_id = request.request_id
+        coverage = getattr(self, "lwd_recv_rows", {}).get(request_id, 0)
+        wire_rows = getattr(self, "lwd_wire_rows", {})
+        if request_id in wire_rows:
+            resume_base = getattr(self, "lwd_resume_bases", {})[request_id]
+            coverage = max(coverage, resume_base + wire_rows[request_id])
+        return min(coverage, request.num_prompt_tokens)
+
+    def _lwd_clear_arrival(self, request_id: str) -> None:
+        getattr(self, "lwd_recv_rows", {}).pop(request_id, None)
+        getattr(self, "lwd_wire_rows", {}).pop(request_id, None)
+        getattr(self, "lwd_resume_bases", {}).pop(request_id, None)
+        getattr(self, "_lwd_runner_resume_bases", {}).pop(request_id, None)
+        getattr(self, "_lwd_prefill_starts", {}).pop(request_id, None)
+
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
         """Freeze a preempted request's arrival-clamped hit before admission."""
         reservations = self.lwd_prefix_reservations
@@ -166,17 +225,17 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 )
             )
 
-        recv_rows = self.lwd_recv_rows.get(request.request_id, 0)
+        coverage = self._lwd_arrival_coverage(request)
         alignment = self.kv_cache_manager.coordinator.scheduler_block_size
-        clamped_hit = min(h_prime, recv_rows // alignment * alignment)
+        clamped_hit = min(h_prime, coverage // alignment * alignment)
         if clamped_hit < h_prime:
             lwd_logger.info(
                 "[cloud-sched] clamp readmission req=%s hit=%d -> %d "
-                "recv_rows=%d alignment=%d",
+                "coverage=%d alignment=%d",
                 request.request_id,
                 h_prime,
                 clamped_hit,
-                recv_rows,
+                coverage,
                 alignment,
             )
             groups = reservations.truncate(groups, clamped_hit)
@@ -258,12 +317,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
                     start = prefix_start(request, reservations)
             if start >= request.num_prompt_tokens:
                 continue
-            recv_rows = self.lwd_recv_rows.get(request_id, 0)
-            arrived = recv_rows - start
+            coverage = self._lwd_arrival_coverage(request)
+            arrived = coverage - start
             if arrived <= 0:
                 continue
             num_rows = min(arrived, room)
-            if num_rows < room and recv_rows < request.num_prompt_tokens:
+            if num_rows < room and coverage < request.num_prompt_tokens:
                 continue
             windows.append(_LwdPrefillWindow(request, num_rows, start))
             room -= num_rows
@@ -299,12 +358,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
             scheduled = out.num_scheduled_tokens.get(request_id, 0)
             if scheduled == 0:
                 continue
-            recv_rows = self.lwd_recv_rows.get(request_id, 0)
-            if scheduled > window.num_rows or window.start + scheduled > recv_rows:
+            coverage = self._lwd_arrival_coverage(window.request)
+            if scheduled > window.num_rows or window.start + scheduled > coverage:
                 raise RuntimeError(
                     f"[LWD] W2 violation req={request_id}: scheduled rows "
                     f"[{window.start}, {window.start + scheduled}) with "
-                    f"window={window.num_rows}, recv_rows={recv_rows}, "
+                    f"window={window.num_rows}, coverage={coverage}, "
                     f"decode_exact={decode_exact}"
                 )
 
@@ -331,6 +390,60 @@ class LwdCloudScheduler(LwdBaseScheduler):
             if request is not None:
                 positions = getattr(request, "lwd_mrope_positions", b"")
                 data.lwd_mrope_positions = b"" if positions is None else positions
+
+    def _lwd_attach_worker_metadata(
+        self,
+        out: SchedulerOutput,
+        windows: Iterable[_LwdPrefillWindow] = (),
+    ) -> None:
+        """Route mixed-batch requests and keep each Runner baseline stable."""
+        metadata: dict[str, LwdRequestMetadata] = {}
+        vllm_config = getattr(self, "vllm_config", None)
+        lwd_config = getattr(vllm_config, "lwd_config", None)
+        topology_ids = (
+            {connection.connection_id for connection in lwd_config.connections}
+            if lwd_config is not None
+            else set()
+        )
+        window_starts = {window.request.request_id: window.start for window in windows}
+        runner_bases = getattr(self, "_lwd_runner_resume_bases", None)
+        if runner_bases is None:
+            runner_bases = self._lwd_runner_resume_bases = {}
+        prefill_starts = getattr(self, "_lwd_prefill_starts", None)
+        if prefill_starts is None:
+            prefill_starts = self._lwd_prefill_starts = {}
+        for request_id in out.num_scheduled_tokens:
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            connection_id = getattr(
+                request, "lwd_connection_id", LwdConnectionId(0, 0, 0)
+            )
+            if topology_ids and connection_id not in topology_ids:
+                raise ValueError(
+                    f"[LWD] request {request_id} names unknown connection "
+                    f"{connection_id}"
+                )
+            resume_base = None
+            if request_id in getattr(self, "lwd_wire_rows", {}):
+                report_base = getattr(self, "lwd_resume_bases", {})[request_id]
+                resume_base = runner_bases.get(request_id, report_base)
+                start = window_starts.get(request_id)
+                if start is not None:
+                    previous_start = prefill_starts.get(request_id)
+                    if request_id not in runner_bases or (
+                        previous_start is not None and start < previous_start
+                    ):
+                        # First capture, preemption rewind, or a lower self-hit:
+                        # later ordinary windows retain this baseline.
+                        resume_base = min(report_base, start)
+                        runner_bases[request_id] = resume_base
+                    prefill_starts[request_id] = start
+            metadata[request_id] = LwdRequestMetadata(
+                connection_id=connection_id,
+                resume_base=resume_base,
+            )
+        out.lwd_request_metadata = metadata
 
     def finish_requests(
         self,
@@ -400,6 +513,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
             scheduler_output, model_runner_output
         )
         self._lwd_cleanup_arrivals(engine_core_outputs)
+        carriers = getattr(model_runner_output, "lwd_down_carriers", None)
+        if carriers:
+            for carrier in carriers:
+                self._lwd_append_carrier_c2e(
+                    carrier, engine_core_outputs, nonce_snapshot
+                )
+            return engine_core_outputs
         carrier = getattr(model_runner_output, "lwd_down_carrier", None)
         if carrier is not None:
             self._lwd_append_carrier_c2e(carrier, engine_core_outputs, nonce_snapshot)
@@ -412,7 +532,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
     ) -> None:
         for outputs in engine_core_outputs.values():
             for request_id in outputs.finished_requests or ():
-                self.lwd_recv_rows.pop(request_id, None)
+                self._lwd_clear_arrival(request_id)
                 self._lwd_dropped.discard(request_id)
 
     def _lwd_c2e_prefix_nonces(

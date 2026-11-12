@@ -65,6 +65,8 @@ class LwdEmbedBatch:
     """Full edge-to-cloud DP connection used to select the UP channel."""
     aborted_req_ids: list[str] = field(default_factory=list)
     is_refill: bool = False
+    lwd_prefix_nonce: int = 0
+    """Request generation for nonce-scoped refill and stale-arrival guards."""
 
     @property
     def dp_idx(self) -> int:
@@ -302,6 +304,21 @@ class KVConnectorBlockState:
         return self.resolve_block_ids(req_id)
 
 
+@dataclass(frozen=True)
+class LwdRequestMetadata:
+    """LWD worker metadata for one request in a native mixed batch."""
+
+    connection_id: LwdConnectionId
+    resume_base: int | None = None
+    """Local-prefix origin for wire-relative host rows.
+
+    None selects the original absolute-prompt Host Staging coordinates. An
+    integer selects ``host_consumed == num_computed_tokens - resume_base``;
+    keeping this optional prevents an absolute arrival watermark from being
+    mistaken for a wire-relative row count.
+    """
+
+
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -387,6 +404,9 @@ class SchedulerOutput:
 
     # LWD batch metadata dispatch to the worker.
     lwd_batch: LwdBatch | None = None
+    # Native mixed batches need request-level connection routing for UP/DOWN.
+    # The map also carries the explicit Host Staging coordinate conversion.
+    lwd_request_metadata: dict[str, LwdRequestMetadata] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
@@ -401,6 +421,7 @@ class SchedulerOutput:
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             lwd_batch=None,
+            lwd_request_metadata={},
         )
 
 
