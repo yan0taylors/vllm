@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Configuration-only API attachment; no service or routing implementation."""
+"""LWD frontend-attach API metadata: CLI flags, endpoint validation and the
+scene/instance rules the attach service (see
+``vllm/entrypoints/openai/lwd/frontend_attach.py``) builds on."""
 
 import argparse
 from dataclasses import dataclass
@@ -35,7 +37,15 @@ def _endpoint(value: str | None, flag: str) -> None:
 
 @dataclass(frozen=True)
 class LwdAPIConfig:
-    """PR #42 API endpoint metadata forwarded with the topology snapshot."""
+    """API endpoint metadata forwarded with the topology snapshot.
+
+    ``client_index`` is the frontend grouping key of the attach service
+    (outputs return to the frontend that stamped the request), never a
+    topology identity: each attach frontend presents a distinct
+    non-primary edge identity whose instance id doubles as its
+    client_index, and frontend 0 belongs to the primary edge running the
+    main command.
+    """
 
     api_server_rpc_port: str | None = None
     """Primary endpoint as IP:port, despite the historical option name."""
@@ -51,15 +61,22 @@ class LwdAPIConfig:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
         group = parser.add_argument_group("LWD API configuration")
-        for flag, action in (
-            ("rpc-port", "start an RPC listener"),
-            ("attach", "attach an existing engine"),
-        ):
-            group.add_argument(
-                f"--api-server-{flag}",
-                metavar="IP:port",
-                help=f"Primary edge endpoint metadata; does not {action}.",
-            )
+        group.add_argument(
+            "--api-server-rpc-port",
+            metavar="IP:port",
+            help="LWD multi-frontend attach (main command): bind the "
+            "frontend registration server on this endpoint's port and "
+            "release the engine handshake only once every attach frontend "
+            "registered (count-to-K barrier).",
+        )
+        group.add_argument(
+            "--api-server-attach",
+            metavar="IP:port",
+            help="LWD multi-frontend attach (attach command): endpoint of "
+            "the main command's --api-server-rpc-port. This command runs "
+            "exactly one ApiServer frontend with its own --host/--port "
+            "listen and no engines.",
+        )
 
     @staticmethod
     def validate_frontend(args: Any, *, headless: bool = False) -> None:
@@ -94,9 +111,21 @@ class LwdAPIConfig:
             raise ValueError("[LWD] API options require lwd_config.path")
         if lwd.role != "edge":
             raise ValueError("[LWD] API options apply to edge instances only")
+        scene = lwd.topology.deployment.scene
+        if scene not in ("edge_share", "cloud_share", "lwd_cluster"):
+            raise ValueError(
+                "[LWD] API attachment metadata requires scene=edge_share, "
+                "cloud_share or lwd_cluster"
+            )
         if self.api_server_rpc_port is not None and lwd.instance_id != 0:
             raise ValueError("[LWD] --api-server-rpc-port requires edge instance_id=0")
         if self.api_server_attach is not None and lwd.instance_id == 0:
             raise ValueError("[LWD] --api-server-attach requires a non-primary edge")
-        if lwd.topology.deployment.scene != "edge_share":
-            raise ValueError("[LWD] API attachment metadata requires scene=edge_share")
+        # Scene coupling of the frontend count K: legacy edge_share keeps
+        # the one-to-one pairing (one frontend per edge instance, K equals
+        # the edge count) with the instance identity as the client_index;
+        # the decoupled cloud_share/lwd_cluster scenes declare K freely
+        # (--api-server-count, no longer tied to the cloud or instance
+        # count) and the client_index is a pure frontend grouping key,
+        # never used for cloud selection. The count check itself lives in
+        # the attach dispatch, which sees the CLI arg.

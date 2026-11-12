@@ -182,6 +182,8 @@ class APIServerProcessManager:
         target_server_fn: Callable | None = None,
         stats_update_address: str | None = None,
         tensor_queue: Queue | None = None,
+        client_count: int | None = None,
+        client_indices: list[int] | None = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -201,7 +203,32 @@ class APIServerProcessManager:
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
             tensor_queue: Optional tensor IPC queue for sharing MM tensors
+            client_count: Total number of frontend clients across all
+                processes (defaults to ``num_servers``). LWD multi-frontend
+                attach mode sets it to the granted frontend count K while
+                spawning only this command's local subset.
+            client_indices: client_index of each spawned server,
+                position-aligned with ``input_addresses``/
+                ``output_addresses`` (defaults to ``range(num_servers)``).
+                Attach mode passes the local frontends' indices (e.g.
+                ``[0]`` on the main command).
         """
+        if client_count is None:
+            client_count = num_servers
+        if client_indices is None:
+            client_indices = list(range(num_servers))
+        if len(client_indices) != num_servers:
+            raise ValueError(
+                f"client_indices (len {len(client_indices)}) must align with "
+                f"num_servers ({num_servers})"
+            )
+        if not all(0 <= index < client_count for index in client_indices):
+            raise ValueError(
+                f"client_indices {client_indices} must lie within "
+                f"[0, {client_count})"
+            )
+        self.client_count = client_count
+        self.client_indices = list(client_indices)
         self.listen_address = listen_address
         self.sock = sock
         self.args = args
@@ -225,8 +252,8 @@ class APIServerProcessManager:
             client_config: dict[str, Any] = {
                 "input_address": in_addr,
                 "output_address": out_addr,
-                "client_count": num_servers,
-                "client_index": i,
+                "client_count": client_count,
+                "client_index": client_indices[i],
             }
             if admission_counters is not None:
                 client_config["mp_admission_counters"] = admission_counters
@@ -261,8 +288,9 @@ class APIServerProcessManager:
         timeout: float = envs.VLLM_ENGINE_READY_TIMEOUT_S,
     ) -> tuple[list[str], list[str]]:
         """Return (inputs, outputs) reported by each child, indexed by
-        ``client_index``. Raises ``RuntimeError`` on timeout or premature
-        child exit."""
+        spawn position; map positions to frontend client indices via
+        ``client_indices``. Raises ``RuntimeError`` on timeout or
+        premature child exit."""
         n = len(self._address_pipes)
         inputs: list[str | None] = [None] * n
         outputs: list[str | None] = [None] * n

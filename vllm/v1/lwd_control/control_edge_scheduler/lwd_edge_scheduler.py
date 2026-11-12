@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import copy
 import time
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -136,6 +136,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         }
         self._lwd_route: dict[str, LwdConnectionId] = {}
         """Request id -> full connection, pinned at admission."""
+        # Multi-frontend attach: request id -> client_index pin, the output
+        # grouping key (never a routing key and never a cloud-selection
+        # key). Written at admission from ``request.client_index`` (absent
+        # means 0, so the single-frontend path is unchanged), removed when
+        # the request leaves the books (finish/abort/cancel-admission).
+        self._lwd_req_id_to_client: dict[str, int] = {}
         self._lwd_last_engine = -1
         """Round-robin anchor shared by routing and engine picking."""
         # Prefix caching: manager-level hits must stay off (the edge holds
@@ -358,7 +364,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         worker-filled req_ids x sampled_token_ids; placeholder batches
         without lwd_batch (the underlying layer returns None on normal
         completion, replaced by the engine proxy with a placeholder) only
-        consume send watermarks."""
+        consume send watermarks.
+
+        Outputs group per client_index (the admission pin): the engine
+        puts each (client_index, EngineCoreOutputs) on its output queue
+        and every frontend only ever sees its own requests' results; the
+        single-frontend path degrades to the {0: ...} group (the pin
+        defaults to 0), which is the previous behavior verbatim."""
         watermarks = getattr(model_runner_output, "lwd_up_send_watermarks", {})
         for key, watermark in watermarks.items():
             connection_id = self._lwd_watermark_connection(key)
@@ -369,8 +381,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 if key[0] != connection_id or key[1] > watermark
             }
         batch = getattr(scheduler_output, "lwd_batch", None)
-        outputs: list[EngineCoreOutput] = []
-        finished: set[str] = set()
+        outputs_by_client: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        finished_by_client: dict[int, set[str]] = defaultdict(set)
         if batch is not None and batch.batch_type == LwdBatchType.LWD_UNEMBED:
             notify = scheduler_output.lwd_c2e_notify[0]
             req_ids = getattr(model_runner_output, "req_ids", None) or ()
@@ -379,7 +391,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 if req_ids
                 else {}
             )
-            outputs, finished = self._lwd_deliver_unembed(notify, sampled)
+            outputs_by_client, finished_by_client = self._lwd_deliver_unembed(
+                notify, sampled
+            )
         # EMBED batches have no local accounting (progress was already
         # advanced optimistically during scheduling; on embedding completion
         # they naturally transition to decode phase); the harvest phase
@@ -388,13 +402,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # explicit per-point removal is replaced by reconciliation-style
         # reclaim)
         self._lwd_purge_mrope_positions()
-        if not outputs:
+        if not outputs_by_client:
             return {}
         return {
-            0: EngineCoreOutputs(
+            client_index: EngineCoreOutputs(
                 outputs=outputs,
-                finished_requests=finished or None,
+                finished_requests=finished_by_client[client_index] or None,
             )
+            for client_index, outputs in outputs_by_client.items()
         }
 
     @staticmethod
@@ -424,13 +439,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, sampled_token_map: dict[str, list[int]]
-    ) -> tuple[list[EngineCoreOutput], set[str]]:
+    ) -> tuple[dict[int, list[EngineCoreOutput]], dict[int, set[str]]]:
         """Per-request delivery: row disposition goes through
         _lwd_row_disposition (zero-accepted live rows are skipped; ERROR
         only when accepted>0 yet token missing); late results not in
-        awaiting are idempotently dropped."""
-        outputs: list[EngineCoreOutput] = []
-        finished: set[str] = set()
+        awaiting are idempotently dropped.
+
+        Rows group by the request's frontend pin: the grouping key is
+        captured at row entry, BEFORE the delivery path can settle the
+        request and pop the pin -- reading it late would route the
+        terminal token/finish of an attached frontend (client_index > 0)
+        to client 0 and the frontend would never see its finish. Late
+        rows for requests that already left the books are dropped (no
+        output, no cross-grouping); late rows for requests still in
+        flight keep their pin and reach the right frontend."""
+        outputs_by_client: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        finished_by_client: dict[int, set[str]] = defaultdict(set)
         # accepted is position-aligned with rows (same contract as
         # lwd_build_unembed_batch); the DISABLE_DOWN bypass carries no
         # accepted, so token presence/absence is used instead
@@ -451,6 +475,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         current_nonce,
                     )
                     continue
+            # Frontend grouping key, fixed before any settle below can pop
+            # the pin (unpinned ids -- single-frontend callers -- group to
+            # 0, the previous behavior).
+            client_index = self._lwd_req_id_to_client.get(request_id, 0)
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
@@ -509,7 +537,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         finish_reason, RequestStatus.FINISHED_STOPPED
                     ),
                 )
-            outputs.append(
+            outputs_by_client[client_index].append(
                 EngineCoreOutput(
                     request_id,
                     sampled_token_ids,
@@ -517,8 +545,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
             )
             if finished_now:
-                finished.add(request_id)
-        return outputs, finished
+                finished_by_client[client_index].add(request_id)
+        return outputs_by_client, finished_by_client
 
     @staticmethod
     def _lwd_finish_code(notify: LwdC2eNotify, index: int) -> FinishReason | None:
@@ -611,12 +639,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def lwd_admit_request(self, request: Request) -> LwdConnectionId:
         """Scheduler-local half of request admission: mode boundary
-        validation, mrope precomputation and routing. Returns the routed
-        connection_id; the cloud announcement and enqueueing belong to the
-        engine's add_request; abort_immediately goes through the native
-        engine path (the ledger is pruned in the abort_requests override)."""
+        validation, mrope precomputation, the frontend pin and routing.
+        Returns the routed connection_id; the cloud announcement and
+        enqueueing belong to the engine's add_request; abort_immediately
+        goes through the native engine path (the ledger and the pin are
+        pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
+        # Frontend pin at entry: outputs group back to the originating
+        # frontend's client_index for the request's whole lifetime
+        # (requests without a client_index pin to 0).
+        self._lwd_req_id_to_client[request.request_id] = getattr(
+            request, "client_index", 0
+        )
         return self._lwd_route_request(request.request_id)
 
     def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> bool:
@@ -972,6 +1007,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         was_awaiting = request_id not in account.prefill_requests
         account.note_request_settled(request_id, was_awaiting)
         self._lwd_route.pop(request_id, None)
+        # Terminal settle: the request leaves the books, so its frontend
+        # pin goes with it (the output row for this finish/abort read the
+        # pin before this point, see _lwd_deliver_unembed).
+        self._lwd_req_id_to_client.pop(request_id, None)
 
     def _lwd_purge_mrope_positions(self) -> None:
         """Reconcile and remove mrope positions: the request has left
