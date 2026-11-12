@@ -18,19 +18,27 @@ gate check.
 
 from __future__ import annotations
 
+from vllm.config.lwd import LwdConnectionId
+
 LWD_MAX_PENDING_CHUNKS = 10
 
 
 class LwdCloudDpAccount:
-    """The edge-side bookkeeping of one cloud DP rank."""
+    """The edge-side bookkeeping of one edge -> cloud DP connection."""
 
     def __init__(
         self,
-        dp_idx: int,
+        connection_id: LwdConnectionId | int,
         max_pending_chunks: int = LWD_MAX_PENDING_CHUNKS,
     ) -> None:
-        self.dp_idx = dp_idx
+        if isinstance(connection_id, int):
+            connection_id = LwdConnectionId(0, 0, connection_id)
+        self.connection_id = connection_id
         self.max_pending_chunks = max_pending_chunks
+        self.num_speculative_tokens = 0
+        self.prefix_use_eagle = False
+        self.prefix_alignment_tokens = 0
+        self.prefix_alignment_required = False
         self.seqno = 0
         """Next UP pairing number of this engine; taken only by a range
         notify that was sent."""
@@ -50,6 +58,11 @@ class LwdCloudDpAccount:
         results."""
         self.gate_held = False
         """Gate state of the last transition, for HOLD/OPEN logging only."""
+
+    @property
+    def dp_idx(self) -> int:
+        """Compatibility view for diagnostics; never use this as a map key."""
+        return self.connection_id.dp_idx
 
     # ------------------------------------------------------------------ load
 
@@ -117,24 +130,16 @@ class LwdCloudDpAccount:
 
     # ------------------------------------------------------------------ gate
 
-    def is_gated(
-        self,
-        max_num_running_reqs: int,
-        has_resume_inflight: bool,
-        *,
-        num_running_reqs: int,
-    ) -> bool:
+    def is_gated(self, max_num_running_reqs: int, has_resume_inflight: bool) -> bool:
         """Whether new prefill admission to this engine must wait.
 
         A resume in flight is exempt (finish in-flight chunks before new
         ones; also prevents a max_num_seqs=1 config from deadlocking on
         itself). Otherwise the engine is gated when its request slots are
-        full or its pending chunks reached the cap. Slot occupancy comes
-        from the native edge running queue; routing load also counts
-        waiting requests, which must not block their own admission.
+        full or its pending chunks reached the cap.
         """
         if has_resume_inflight:
             return False
-        if num_running_reqs >= max_num_running_reqs:
+        if self.load >= max_num_running_reqs:
             return True
         return self.pending_chunks() >= self.max_pending_chunks
