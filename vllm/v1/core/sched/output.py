@@ -59,9 +59,7 @@ class LwdEmbedBatch:
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
-    connection_id: LwdConnectionId = field(
-        default_factory=lambda: LwdConnectionId(0, 0, 0)
-    )
+    connection_id: LwdConnectionId = LwdConnectionId(0, 0, 0)
     """Full edge -> cloud DP connection; the worker selects its UP channel."""
     aborted_req_ids: list[str] = field(default_factory=list)
     is_refill: bool = False
@@ -88,9 +86,7 @@ class LwdUnembedBatch:
     token_ids: list[list[int]] = field(
         default_factory=list
     )  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
-    connection_id: LwdConnectionId = field(
-        default_factory=lambda: LwdConnectionId(0, 0, 0)
-    )
+    connection_id: LwdConnectionId = LwdConnectionId(0, 0, 0)
     """Full edge -> cloud DP connection; the worker selects its DOWN channel."""
 
 
