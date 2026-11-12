@@ -148,7 +148,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_hint_mqs = {
             connection: create_hint_mq(connection) for connection in connections
         }
-        self._lwd_hint_mq = self._lwd_hint_mqs[connections[0]]
         super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
         # The cloud endpoint worker created its done-report MQ during
         # init_device; now that the executor is up, fetch its handle over
@@ -174,7 +173,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self._lwd_done_mqs[connection] = MessageQueue.create_from_handle(
                 handles[0], 0
             )
-        self._lwd_done_mq = next(iter(self._lwd_done_mqs.values()))
         lwd_logger.info(
             "[pre-recv] %d hint MQ(s) created, done MQs attached via RPC",
             len(self._lwd_hint_mqs),
@@ -922,17 +920,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_drain_irecv_completions(self) -> None:
         """Merge every connection's done MQ into independent watermarks."""
-        done_mqs = getattr(self, "_lwd_done_mqs", None)
-        if not done_mqs:
-            return
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             record_irecv_completions,
         )
 
         watermark_items: list[Any] = []
-        for connection, done_mq in done_mqs.items():
-            if done_mq is None:
-                continue
+        for connection, done_mq in self._lwd_done_mqs.items():
             while True:
                 try:
                     item = done_mq.dequeue(timeout=0)
@@ -945,27 +938,22 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     break
                 if (
                     isinstance(item, tuple)
-                    and item
+                    and len(item) == 3
                     and item[0] == "refill_done"
                 ):
-                    if len(item) == 2:
-                        self.scheduler.lwd_refill_done(str(item[1]))
-                    elif len(item) == 3:
-                        self.scheduler.lwd_refill_done(str(item[1]), int(item[2]))
+                    self.scheduler.lwd_refill_done(str(item[1]), int(item[2]))
                     continue
                 if (
                     isinstance(item, tuple)
                     and len(item) == 4
                     and item[1] == "error"
                 ):
+                    if item[0] != connection:
+                        raise ValueError(
+                            f"[LWD] cross-connection early-recv error on "
+                            f"{connection}: {item!r}"
+                        )
                     self._lwd_fail_connection(connection, item[2], item[3])
-                    continue
-                if (
-                    isinstance(item, tuple)
-                    and len(item) == 3
-                    and item[0] == "error"
-                ):
-                    self._lwd_fail_connection(connection, item[1], item[2])
                     continue
                 if (
                     isinstance(item, tuple)
@@ -973,17 +961,27 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     and isinstance(item[0], tuple)
                 ):
                     key, arrived = item
+                    if len(key) != 3:
+                        raise ValueError(
+                            "[LWD] early-recv completion key must be "
+                            f"(connection, channel, seqno), got {key!r}"
+                        )
+                    if key[0] != connection:
+                        raise ValueError(
+                            f"[LWD] cross-connection early-recv completion on "
+                            f"{connection}: {item!r}"
+                        )
                     watermark_items.append(key)
-                    if len(key) == 3:
-                        self._lwd_note_arrived(key[0], key[2], arrived)
-                else:
-                    watermark_items.append(item)
+                    self._lwd_note_arrived(key[0], key[2], arrived)
+                    continue
+                raise ValueError(
+                    f"[LWD] unsupported early-recv completion item: {item!r}"
+                )
         if not watermark_items:
             return
         advanced = record_irecv_completions(watermark_items)
-        for item in advanced:
-            if len(item) == 3:
-                self._lwd_complete_seqno(item[0], item[2])
+        for connection, _, seqno in advanced:
+            self._lwd_complete_seqno(connection, seqno)
         lwd_logger.info(
             "[Lwd][pre-recv] DRAIN n=%d advanced=%s ts=%.3f",
             len(watermark_items),
