@@ -33,6 +33,10 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_executor_proxy import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_prefix_control import (
     LwdEdgePrefixControl,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe_admission import (
+    LwdEdgeProbeAdmission,
+    LwdProbeWake,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
 )
@@ -116,6 +120,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             for connection_id, params in self._lwd_cloud_params.items()
             if params.dp_coordinator_addr
         }
+        # Coordination probes (routing receipts) submit at request entry and
+        # finalize the admission when the receipt lands; None = off (the
+        # pre-MR3 direct admission path).
+        self._lwd_probe_admission = LwdEdgeProbeAdmission.create(self)
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         self.scheduler.lwd_refill_abort = self._lwd_abort_refill
         self.is_pooling_model = True
@@ -160,6 +168,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.scheduler._lwd_prefix_hash_block_size = control.hash_block_size
 
     def shutdown(self) -> None:
+        control = getattr(self, "_lwd_probe_admission", None)
+        if control is not None:
+            control.shutdown()
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None:
             control.shutdown()
@@ -236,11 +247,28 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             request.request_id,
             request.num_prompt_tokens,
         )
-        if self.scheduler.lwd_edge_request_active(request.request_id):
+        admission = getattr(self, "_lwd_probe_admission", None)
+        if (
+            self.scheduler.lwd_edge_request_active(request.request_id)
+            or (admission is not None and request.request_id in admission)
+        ):
             lwd_logger.error(
                 "[edge] reject duplicate active request req=%s", request.request_id
             )
             raise AssertionError(f"duplicate active request id: {request.request_id}")
+        if (
+            admission is not None
+            and not request.abort_immediately
+            and admission.submit(request)
+        ):
+            # Inflight probe: the admission (announce + enqueue, or the
+            # prefix wait) finalizes when the receipt lands on drain.
+            return
+        self._lwd_admit_or_wait(request)
+
+    def _lwd_admit_or_wait(self, request: Request) -> None:
+        """Admission after the probe (or with probes off): the prefix
+        control wait path, or the direct announce + enqueue."""
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None and not request.abort_immediately:
             control.add_request(request)
@@ -265,6 +293,16 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
+        admission = getattr(self, "_lwd_probe_admission", None)
+        if (
+            admission is not None
+            and request_type == EngineCoreRequestType.WAKEUP
+            and isinstance(request, LwdProbeWake)
+        ):
+            # Receipt consumption hook: the probe thread queued an outcome
+            # and woke the engine; the drain finalizes the admission.
+            admission.drain()
+            return
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None and control.handle_client_request(request_type, request):
             return
@@ -295,6 +333,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._send_abort_outputs_to_client([request.request_id], request.client_index)
 
     def abort_requests(self, request_ids: list[str]) -> None:
+        admission = getattr(self, "_lwd_probe_admission", None)
+        if admission is not None:
+            admission.prepare_abort(request_ids)
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None:
             control.prepare_abort(request_ids)

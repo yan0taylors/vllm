@@ -12,12 +12,24 @@ result terminates the request (finish code mapped to native finish), and
 late results are idempotently dropped.
 
 One LwdCloudDpAccount holds every per-engine bookkeeping (seqno stream,
-pending batches, load, gate); the routing table is pinned at admission and
-never changes, so a request's chunks, aborts and results all travel
-through its engine's account. Each schedule step serves one engine: a
-RangeNotify, a seqno and a UP channel belong to exactly one engine. With
-one cloud DP rank every account method degenerates to the previous
-single-cloud behaviour.
+pending batches, load, gate); the route is pinned at admission and never
+changes, so a request's chunks, aborts and results all travel through its
+engine's account. Each schedule step serves one engine: a RangeNotify, a
+seqno and a UP channel belong to exactly one engine. With one cloud DP
+rank every account method degenerates to the previous single-cloud
+behaviour.
+
+Cloud selection (MR3) picks the cloud at admission in three forms, by
+fallback order: the coordination probe receipt (the gateway / central
+scheduler's routing answer, pinned cloud + dp), the single-cloud
+topology (the compatibility form, the pre-MR3 path untouched) and the
+round-robin rotation over the declared clouds (multi-cloud without
+coordination, one-shot warning inside LwdMvRouter). The binding table
+holds the chosen cloud for the request's whole life: range announcements
+and aborts follow it, and finish/abort unbinds it so a late cloud result
+finds no request to claim. C2E delivery is accounted by the notify's
+source (cloud_id, dp_idx): a result is claimed only by the connection
+its request is bound to.
 """
 
 from __future__ import annotations
@@ -26,7 +38,7 @@ import copy
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -67,6 +79,8 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRefillNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_coordination.lwd_binding import LwdEdgeBindingTable
+from vllm.v1.lwd_control.lwd_coordination.lwd_mv_router import LwdMvRouter
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
@@ -75,6 +89,10 @@ if TYPE_CHECKING:
 
 LwdSendToCloud = Callable[[LwdConnectionId, LwdEdgeToCloudMessage], None]
 """Sends one message on a full edge-to-cloud DP connection."""
+
+_LWD_UNSTAMPED = LwdConnectionId(0, 0, 0)
+"""Default connection stamp of an unstamped batch (the legacy / K=1 default
+identity); delivery treats it as "source unknown" and skips the claim check."""
 
 # Cloud finish code -> edge terminal state (frontend reason goes through the
 # output channel; ERROR maps to ABORTED)
@@ -115,29 +133,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self.lwd_refill_abort: Callable[[str], None] | None = None
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
-        self._lwd_connections = tuple(
-            sorted(connection.connection_id for connection in lwd_config.connections)
-        )
-        self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {
-            connection_id: LwdCloudDpAccount(connection_id, LWD_MAX_PENDING_CHUNKS)
-            for connection_id in self._lwd_connections
-        }
-        # MR1 retains the existing single-cloud DP balancer. Additional clouds
-        # are discovered by the control plane but are not routing candidates
-        # until MR3; cloud 0 is the compatibility fallback.
-        fallback_cloud_id = self._lwd_connections[0].cloud_id
-        self._lwd_routing_connections = tuple(
-            connection_id
-            for connection_id in self._lwd_connections
-            if connection_id.cloud_id == fallback_cloud_id
-        )
+        self._lwd_setup_routing(lwd_config)
         self._lwd_aborted_req_ids: dict[LwdConnectionId, list[str]] = {
             connection_id: [] for connection_id in self._lwd_connections
         }
-        self._lwd_route: dict[str, LwdConnectionId] = {}
-        """Request id -> full connection, pinned at admission."""
-        self._lwd_last_engine = -1
-        """Round-robin anchor shared by routing and engine picking."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
@@ -169,6 +168,73 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     # ------------------------------------------------------------- routing
 
+    def _lwd_setup_routing(self, lwd_config: Any) -> None:
+        """Cloud routing state: connections, per-connection accounts, the
+        cloud domain, the binding table, the multi-value router and the
+        probe receipt ledger. A standalone method (not inline __init__
+        lines) so the routing tests build the exact production state."""
+        self._lwd_connections = tuple(
+            sorted(connection.connection_id for connection in lwd_config.connections)
+        )
+        self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {
+            connection_id: LwdCloudDpAccount(connection_id, LWD_MAX_PENDING_CHUNKS)
+            for connection_id in self._lwd_connections
+        }
+        # Cloud routing domain: every declared cloud is a routing candidate
+        # (probe receipt > single cloud > rotation). With one cloud the
+        # candidates equal the pre-MR3 same-cloud set, so the single-cloud
+        # path is bit-for-bit the previous behaviour.
+        self._lwd_cloud_ids: tuple[int, ...] = tuple(
+            sorted({connection.cloud_id for connection in self._lwd_connections})
+        )
+        self._lwd_connections_of_cloud: dict[int, tuple[LwdConnectionId, ...]] = {
+            cloud_id: tuple(
+                connection_id
+                for connection_id in self._lwd_connections
+                if connection_id.cloud_id == cloud_id
+            )
+            for cloud_id in self._lwd_cloud_ids
+        }
+        self._lwd_routing_connections = self._lwd_connections
+        self._lwd_route: dict[str, LwdConnectionId] = {}
+        """Request id -> full connection, pinned at admission."""
+        self._lwd_last_engine = -1
+        """Round-robin anchor shared by routing and engine picking."""
+        # Request-to-cloud binding ledger: bound at admission, unbound at
+        # finish/abort, so a late cloud result no longer finds a request
+        # to claim.
+        self._lwd_binding = LwdEdgeBindingTable()
+        coordination = lwd_config.coordination
+        self._lwd_coordination = coordination
+        # Probes on = coordination enabled with an endpoint (the edge role
+        # validation enforces the endpoint whenever coordination is on).
+        self._lwd_coordination_probing = bool(
+            coordination is not None
+            and coordination.enabled
+            and (coordination.control_url or coordination.control_url_map)
+        )
+        if coordination is not None and coordination.control_url_map:
+            # Multi-value direct form: the router rotates over the probe
+            # endpoints with health cooldown.
+            mv_url_map = coordination.control_url_map
+        elif not self._lwd_coordination_probing and len(self._lwd_cloud_ids) > 1:
+            # Multi-cloud without coordination: a rotation-only domain (the
+            # URL values are placeholders -- nothing is ever probed, only
+            # the deterministic rotation and its one-shot warning are used).
+            mv_url_map = dict.fromkeys(self._lwd_cloud_ids, "")
+        else:
+            # Single cloud, or the single-value gateway form (the gateway
+            # routes; the edge never rotates).
+            mv_url_map = None
+        self._lwd_mv_router = LwdMvRouter(mv_url_map, self._lwd_cloud_ids)
+        # Probe receipts (request_id -> pinned (cloud_id, dp_idx)),
+        # registered by the engine's probe admission before the announce;
+        # popped with the route at settlement.
+        self._lwd_probe_route: dict[str, tuple[int, int]] = {}
+        self._lwd_receipt_anomalies: set[tuple[int, int]] = set()
+        """One-shot warning ledger of receipt pins that named an unknown
+        (cloud, dp) pair."""
+
     def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
         """Routed connection of an active request; unrouted ids are a bug."""
         return self._lwd_route[request_id]
@@ -177,30 +243,63 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Routed connection, or None once the request left the books."""
         return self._lwd_route.get(request_id)
 
-    def _lwd_route_request(self, request_id: str) -> LwdConnectionId:
-        """Pin a request using the existing same-cloud DP load balancer."""
-        if len(self._lwd_routing_connections) == 1:
-            connection_id = self._lwd_routing_connections[0]
+    def _lwd_select_cloud(self, request_id: str) -> tuple[int, int | None]:
+        """Choose the target cloud (and optional pinned dp) of a new request.
+
+        Fallback order: the coordination probe receipt (pinned cloud + dp,
+        registered before the admission announce), the single-cloud
+        topology (the pre-MR3 compatibility form), then the rotation over
+        the declared clouds. In the multi-value coordination form the
+        submission point already advanced the rotation, so a missing
+        receipt fail-opens onto the pending position (peek, a pure read);
+        with the single-value gateway form the fixed first cloud is the
+        fail-open landing spot (the gateway routes, the edge never
+        rotates). Without coordination the admission itself is the one
+        advance point of the rotation."""
+        pinned = self._lwd_probe_route.get(request_id)
+        if pinned is not None:
+            return pinned
+        if len(self._lwd_cloud_ids) == 1:
+            return (self._lwd_cloud_ids[0], None)
+        coordination = self._lwd_coordination
+        if coordination is not None and coordination.control_url_map:
+            cloud = self._lwd_mv_router.peek_cloud()
+        elif not self._lwd_coordination_probing:
+            cloud = self._lwd_mv_router.next_cloud()
         else:
-            accounts = [
-                self._lwd_accounts[connection_id]
-                for connection_id in self._lwd_routing_connections
-            ]
-            best = min(
-                accounts,
-                key=lambda account: (
-                    account.score(),
-                    (
-                        self._lwd_routing_connections.index(account.connection_id)
-                        - self._lwd_last_engine
-                    )
-                    % len(accounts),
+            cloud = None
+        if cloud is None:
+            cloud = self._lwd_cloud_ids[0]
+        return (cloud, None)
+
+    def _lwd_route_request(self, request_id: str) -> LwdConnectionId:
+        """Pin a request to one connection: cloud selection (receipt >
+        single cloud > rotation) then the same-cloud DP balancer, and bind
+        the chosen cloud in the binding table (before the admission
+        announce, hence before every range announcement)."""
+        cloud_id, pinned_dp = self._lwd_select_cloud(request_id)
+        connections = self._lwd_connections_of_cloud.get(cloud_id)
+        if not connections:
+            # Unreachable (selection only returns declared clouds); kept
+            # as a fail-open guard for the pre-MR3 first-cloud fallback.
+            connections = self._lwd_connections_of_cloud[self._lwd_cloud_ids[0]]
+        if pinned_dp is not None:
+            connection_id = next(
+                (
+                    connection
+                    for connection in connections
+                    if connection.dp_idx == pinned_dp
                 ),
+                None,
             )
-            connection_id = best.connection_id
+            if connection_id is None:
+                connection_id = self._lwd_balance_within_cloud(connections)
+        else:
+            connection_id = self._lwd_balance_within_cloud(connections)
         account = self._lwd_accounts[connection_id]
         account.note_prefill_admitted(request_id)
         self._lwd_route[request_id] = connection_id
+        self._lwd_binding.bind(request_id, connection_id.cloud_id)
         lwd_logger.info(
             "[edge-route] req=%s -> %s (score=%d loads=%s)",
             request_id,
@@ -214,6 +313,93 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ],
         )
         return connection_id
+
+    def _lwd_balance_within_cloud(
+        self, connections: tuple[LwdConnectionId, ...]
+    ) -> LwdConnectionId:
+        """Same-cloud DP load balancer over one cloud's connections; with a
+        single connection it is a direct pick (the K=1 path)."""
+        if len(connections) == 1:
+            return connections[0]
+        accounts = [self._lwd_accounts[connection_id] for connection_id in connections]
+        best = min(
+            accounts,
+            key=lambda account: (
+                account.score(),
+                (
+                    connections.index(account.connection_id)
+                    - self._lwd_last_engine
+                )
+                % len(accounts),
+            ),
+        )
+        return best.connection_id
+
+    def lwd_edge_next_probe_target(self) -> tuple[int | None, str | None]:
+        """Submission target of the next coordination probe: the multi-value
+        rotation pick (this call is the one advance point of the rotation,
+        exactly one per submitted request) or the single-value endpoint.
+
+        (None, None) means no probe endpoint (probes off or an inactive
+        map): the caller proceeds without a probe and the fallback chain
+        routes."""
+        coordination = self._lwd_coordination
+        if not self._lwd_coordination_probing or coordination is None:
+            return (None, None)
+        if coordination.control_url_map:
+            cloud = self._lwd_mv_router.next_cloud()
+            if cloud is None:
+                return (None, None)
+            return (cloud, coordination.control_url_map.get(cloud))
+        return (None, coordination.control_url)
+
+    def lwd_edge_note_probe_receipt(
+        self,
+        request_id: str,
+        target_cloud: int | None,
+        receipt_cloud: int | None,
+        dp_idx: int,
+    ) -> None:
+        """Register a probe receipt's routing pin for a request about to be
+        admitted.
+
+        The router resolves the receipt authority (the submission target
+        wins in the multi-value form, the receipt itself in the
+        single-value gateway form). A receipt without any cloud id still
+        pins the in-cloud dp when the topology has one cloud; a pin naming
+        an unknown (cloud, dp) pair warns once and is dropped so the
+        admission falls back to the selection chain."""
+        cloud = self._lwd_mv_router.resolve_receipt(target_cloud, receipt_cloud)
+        if cloud is None and len(self._lwd_cloud_ids) == 1:
+            cloud = self._lwd_cloud_ids[0]
+        if cloud is None:
+            return
+        connections = self._lwd_connections_of_cloud.get(cloud)
+        if not connections or dp_idx not in {
+            connection.dp_idx for connection in connections
+        }:
+            anomaly = (cloud, dp_idx)
+            if anomaly not in self._lwd_receipt_anomalies:
+                self._lwd_receipt_anomalies.add(anomaly)
+                lwd_logger.warning(
+                    "[edge-route] probe receipt pin (cloud=%d, dp=%d) matches "
+                    "no declared connection; req=%s routes by the fallback "
+                    "chain (check the gateway routing ids vs the topology)",
+                    cloud,
+                    dp_idx,
+                    request_id,
+                )
+            return
+        self._lwd_probe_route[request_id] = (cloud, dp_idx)
+
+    def lwd_edge_note_probe_health(self, target_cloud: int, healthy: bool) -> None:
+        """Feed the multi-value router's health marking from a probe
+        outcome (no-op in every other form: only the multi-value
+        submission target is health-accounted)."""
+        if healthy:
+            self._lwd_mv_router.health_ok(target_cloud)
+        else:
+            self._lwd_mv_router.health_fail(target_cloud)
 
     def _lwd_account_of(self, request_id: str) -> LwdCloudDpAccount | None:
         connection_id = self._lwd_dp_of_settling(request_id)
@@ -379,7 +565,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 if req_ids
                 else {}
             )
-            outputs, finished = self._lwd_deliver_unembed(notify, sampled)
+            # C2E accounting by source (cloud_id, dp_idx): the stamp the
+            # engine recorded from the delivering link. The default (0,0,0)
+            # stamp (unstamped batches, K=1 with default ids) skips the
+            # claim check, preserving the pre-MR3 path bit for bit.
+            source = batch.batch_meta.connection_id
+            outputs, finished = self._lwd_deliver_unembed(
+                notify, sampled, None if source == _LWD_UNSTAMPED else source
+            )
         # EMBED batches have no local accounting (progress was already
         # advanced optimistically during scheduling; on embedding completion
         # they naturally transition to decode phase); the harvest phase
@@ -423,12 +616,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return "deliver"
 
     def _lwd_deliver_unembed(
-        self, notify: LwdC2eNotify, sampled_token_map: dict[str, list[int]]
+        self,
+        notify: LwdC2eNotify,
+        sampled_token_map: dict[str, list[int]],
+        source: LwdConnectionId | None = None,
     ) -> tuple[list[EngineCoreOutput], set[str]]:
         """Per-request delivery: row disposition goes through
         _lwd_row_disposition (zero-accepted live rows are skipped; ERROR
         only when accepted>0 yet token missing); late results not in
-        awaiting are idempotently dropped."""
+        awaiting are idempotently dropped.
+
+        ``source`` is the delivering link's connection (cloud_id, dp_idx):
+        a result is claimed only by its request's own connection -- the
+        route pin must match the source and the binding must still hold
+        the source cloud. A misrouted or post-unbind result claims nothing
+        (the request stays awaiting its own cloud's answer); None (the
+        unstamped default) skips the check, preserving the pre-MR3 path."""
         outputs: list[EngineCoreOutput] = []
         finished: set[str] = set()
         # accepted is position-aligned with rows (same contract as
@@ -451,6 +654,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         current_nonce,
                     )
                     continue
+            if source is not None and not self._lwd_result_claimed(
+                request_id, source
+            ):
+                continue
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
@@ -519,6 +726,28 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if finished_now:
                 finished.add(request_id)
         return outputs, finished
+
+    def _lwd_result_claimed(
+        self, request_id: str, source: LwdConnectionId
+    ) -> bool:
+        """Whether a c2e result from ``source`` may claim its request: the
+        route pin (cloud + dp) must match the source and the binding must
+        still hold the source cloud. Settled (unbound, unrouted) requests
+        and cross-cloud misroutes claim nothing; the request stays
+        awaiting its own cloud's answer."""
+        route = self._lwd_dp_of_settling(request_id)
+        bound = self._lwd_binding.cloud_of(request_id)
+        if route == source and bound == source.cloud_id:
+            return True
+        lwd_logger.warning(
+            "[edge-deliver] drop unclaimed result req=%s from %s "
+            "(route=%s bound=%s): not this request's cloud",
+            request_id,
+            source,
+            route,
+            bound,
+        )
+        return False
 
     @staticmethod
     def _lwd_finish_code(notify: LwdC2eNotify, index: int) -> FinishReason | None:
@@ -972,6 +1201,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         was_awaiting = request_id not in account.prefill_requests
         account.note_request_settled(request_id, was_awaiting)
         self._lwd_route.pop(request_id, None)
+        # Release the binding and any probe receipt: a late result for this
+        # request finds no bound cloud and no route to claim.
+        self._lwd_binding.unbind(request_id)
+        self._lwd_probe_route.pop(request_id, None)
 
     def _lwd_purge_mrope_positions(self) -> None:
         """Reconcile and remove mrope positions: the request has left

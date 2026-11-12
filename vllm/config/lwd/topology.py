@@ -20,6 +20,7 @@ from pydantic import (
     StrictStr,
     TypeAdapter,
     field_validator,
+    model_validator,
 )
 from pydantic.dataclasses import dataclass
 
@@ -27,6 +28,7 @@ LwdId = Annotated[int, Field(strict=True, ge=0)]
 LwdCount = Annotated[int, Field(strict=True, ge=1)]
 LwdPort = Annotated[int, Field(strict=True, ge=1, le=65535)]
 LwdString = Annotated[StrictStr, Field(pattern=r"\S")]
+LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
 
 
 def _address(value: str) -> str:
@@ -34,6 +36,43 @@ def _address(value: str) -> str:
     if address.is_unspecified or address.is_multicast:
         raise ValueError("[LWD] addr must be a unicast endpoint IP")
     return str(address)
+
+
+def _http_endpoint(value: str, field: str) -> str:
+    url = urlsplit(value)
+    if url.scheme not in ("http", "https") or not url.hostname:
+        raise ValueError(f"[LWD] {field} must be an HTTP(S) endpoint")
+    return value
+
+
+def parse_cloud_url_map(raw: object) -> dict[int, str]:
+    """Parse the multi-value control_url mapping (cloud_id -> URL).
+
+    Keys may arrive as strings (JSON) or ints (YAML) and are normalized to
+    non-negative ints; values must be strings naming HTTP(S) endpoints.
+    Parse failures fail fast, the same severity as schema errors: silently
+    dropping the map would disable the whole probe chain and fall
+    multi-cloud routing back to the first cloud without any error.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("[LWD] control_url map must be an object of cloud_id -> URL")
+    parsed: dict[int, str] = {}
+    for key, value in raw.items():
+        try:
+            cloud_id = int(key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"[LWD] control_url map keys must be cloud ids (integers): {key!r}"
+            ) from exc
+        if cloud_id < 0:
+            raise ValueError(
+                f"[LWD] control_url map keys must be non-negative: {key!r}"
+            )
+        if not isinstance(value, str):
+            raise ValueError(f"[LWD] control_url map values must be strings: {key!r}")
+        _http_endpoint(value, f"control_url_map[{cloud_id}]")
+        parsed[cloud_id] = value
+    return parsed
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -75,9 +114,6 @@ class LwdFeatures:
     scramble: LwdScramble = Field(default_factory=LwdScramble)
 
 
-LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
-
-
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdControlPlaneConfig:
     """Edge-cloud control link tunables, shared by every instance."""
@@ -98,6 +134,14 @@ class LwdCoordination:
     enabled: StrictBool = False
     # Edge-side fields
     control_url: LwdString | None = None
+    """Single-value form (gateway/single cloud); a dict literal is the
+    multi-value form, normalized into control_url_map below."""
+    control_url_map: dict[int, str] | None = None
+    """Multi-value direct form (cloud_id -> URL, dev/debug fallback): the
+    edge picks a cloud itself by round-robin instead of the gateway."""
+    placement_only: StrictBool = False
+    """Probe only places the request on a cloud DP (pure load balancing,
+    no HMAC chain); drops the tenant key and prefix caching requirements."""
     tenant_key_file: LwdString | None = None
     consumer_id: LwdString | None = None
     # Cloud-side fields
@@ -108,14 +152,43 @@ class LwdCoordination:
     connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
         10.0
     )
+    probe_timeout: LwdPositiveSeconds = 25.0
+    """End-to-end probe deadline: the cloud answers at probe_timeout-5 and
+    the edge gives up at probe_timeout, so the cloud answers first."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_control_url(cls, data: Any) -> Any:
+        """Fold the dict spelling of control_url into control_url_map; the
+        two spellings are mutually exclusive (both given is a config
+        ambiguity)."""
+        if not isinstance(data, dict):
+            return data
+        raw_url = data.get("control_url")
+        raw_map = data.get("control_url_map")
+        if raw_url is not None and raw_map is not None:
+            raise ValueError(
+                "[LWD] control_url (single/map form) and control_url_map are "
+                "mutually exclusive"
+            )
+        if isinstance(raw_url, dict):
+            data = dict(data)
+            data["control_url_map"] = parse_cloud_url_map(raw_url)
+            data.pop("control_url")
+        return data
 
     @field_validator("control_url")
     @classmethod
     def validate_url(cls, value: str | None) -> str | None:
         if value is not None:
-            url = urlsplit(value)
-            if url.scheme not in ("http", "https") or not url.hostname:
-                raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+            _http_endpoint(value, "control_url")
+        return value
+
+    @field_validator("control_url_map", mode="before")
+    @classmethod
+    def validate_map(cls, value: object) -> object:
+        if value is not None:
+            return parse_cloud_url_map(value)
         return value
 
 
@@ -250,6 +323,29 @@ class LwdTopology:
             )
         self._validate_ranks()
         self._validate_control_ports()
+        self._validate_coordination_maps()
+
+    def _validate_coordination_maps(self) -> None:
+        """Edge-cloud consistency of the multi-value control_url form.
+
+        Map keys are cloud ids the edge will probe directly; a key that is
+        not a declared cloud would bind requests to a cloud without a
+        data-plane channel, so it fails fast here at load time instead of on
+        the first probe. Missing clouds stay legal (they are simply never
+        selected); the router announces them once at runtime.
+        """
+        cloud_ids = [cloud.id for cloud in self.clouds]
+        for instance in (*self.edges, *self.clouds):
+            coordination = instance.coordination
+            if coordination is None or not coordination.control_url_map:
+                continue
+            extra = sorted(set(coordination.control_url_map) - set(cloud_ids))
+            if extra:
+                raise ValueError(
+                    f"[LWD] instance {instance.id} control_url_map keys {extra} "
+                    "are not declared clouds: a probed cloud without a "
+                    "data-plane channel would bind requests nowhere"
+                )
 
     def _validate_ranks(self) -> None:
         for edge in self.edges:
