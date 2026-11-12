@@ -15,10 +15,17 @@ from collections.abc import Iterator
 from enum import Enum, auto
 from typing import Any
 
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
+
+# Bound of the finished-record ledger: entries are consumed by the engine
+# usage settlement (consumed = removed); the bound evicts the residue of
+# requests whose settlement never ran (an engine without coordination).
+_LWD_FINISHED_RECORDS_CAP = 1024
+_LWD_FINISHED_RECORDS_EVICT = 256
 
 
 def lwd_spec_factor(vllm_config) -> int:
@@ -47,8 +54,19 @@ class LwdReqPhase(Enum):
 
 
 class LwdBaseScheduler(AsyncScheduler):
-    """Common base class for edge/cloud schedulers (an AsyncScheduler
+    """Common base class of edge/cloud schedulers (an AsyncScheduler
     subclass)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Finished-request snapshots: request_id -> (prompt_tokens,
+        # completion_tokens). _free_request is the single release choke
+        # point (natural terminations call it directly from
+        # update_from_output, aborts and errors through finish_requests),
+        # while the LWD usage settlement runs later — after the request has
+        # left self.requests — so the minimal snapshot is captured at the
+        # choke point and popped by the consumer.
+        self.lwd_finished_records: dict[str, tuple[int, int]] = {}
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """Native-compatible scheduling entry: step_with_batch_queue passes
@@ -142,7 +160,11 @@ class LwdBaseScheduler(AsyncScheduler):
             if reservations is not None and out is not None:
                 for request_id, num_tokens in out.num_scheduled_tokens.items():
                     if num_tokens > 0:
-                        reservations.release(request_id)
+                        # First successful allocation: ownership of the hit
+                        # blocks passes to the request's own KV chain, and
+                        # the hit is frozen into the snapshot ledger for
+                        # the later usage settlement.
+                        reservations.release(request_id, allocated=True)
         finally:
             self.max_num_running_reqs = saved_cap
             self.max_num_scheduled_tokens = saved_budget
@@ -169,6 +191,38 @@ class LwdBaseScheduler(AsyncScheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The single release choke point of every terminal path.
+
+        The finished snapshot lands here so the usage settlement can read
+        it after the fact: natural terminations reach this method directly
+        from update_from_output (never through finish_requests), while
+        aborts and errors pass through finish_requests into it. At this
+        moment the request object is alive with final lengths. The engine
+        consumes the record when it settles usage; the bound evicts the
+        residue of settlements that never run.
+
+        The reservation release and the refill-gate cleanup fold into the
+        same choke point: a reserve-before-first-allocation abort, a failed
+        negotiation rollback and an in-flight refill abort all end here.
+        """
+        try:
+            records = getattr(self, "lwd_finished_records", None)
+            if records is None:
+                records = self.lwd_finished_records = {}
+            records[request.request_id] = (
+                request.num_prompt_tokens,
+                request.num_tokens - request.num_prompt_tokens,
+            )
+            if len(records) > _LWD_FINISHED_RECORDS_CAP:
+                for stale in list(records)[:_LWD_FINISHED_RECORDS_EVICT]:
+                    records.pop(stale, None)
+                lwd_logger.warning(
+                    "[sched] finished-record ledger full; evicted the oldest"
+                )
+        except Exception:  # noqa: BLE001  a failed snapshot must not block the release
+            lwd_logger.warning(
+                "[sched] finished snapshot failed (non-fatal)", exc_info=True
+            )
         reservations = getattr(self, "lwd_prefix_reservations", None)
         if reservations is not None:
             reservations.release(request.request_id)

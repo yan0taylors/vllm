@@ -7,7 +7,10 @@ Range notifies post extended early-receive hints, request notifies become
 native ADDs with prompt-length and M-RoPE metadata, and abort notifies use the
 native ABORT path. Step metadata is flushed to the edge in post_step. The
 transport accepts independent per-edge sessions; MR4 owns multi-edge request
-namespaces and role-side output accounting.
+namespaces and role-side output accounting. The coordination plane adds an
+HTTP probe/usage endpoint: its commands are consumed by the engine step
+loop (LwdProbeQueryAdapter answers read-only), and finished requests settle
+their usage back onto the endpoint's SSE stream.
 
 The LWD seams live in LwdCloudEngineCoreMixin and are orthogonal to the
 engine base: LwdCloudEngineCore (EngineCoreProc) serves one DP rank of a
@@ -19,6 +22,7 @@ publishing) unchanged.
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
 import time
@@ -63,6 +67,19 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_message_connection_id,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_coordination.lwd_cloud_control import (
+    LwdCloudControlProcessor,
+    lwd_start_cloud_control_server,
+)
+from vllm.v1.lwd_control.lwd_coordination.lwd_prefix import (
+    LwdPrefixManifest,
+    LwdProbeResult,
+    LwdUsage,
+)
+from vllm.v1.lwd_control.lwd_coordination.lwd_request_namespace import (
+    lwd_unwrap_request_id,
+    lwd_wrap_request_id,
+)
 from vllm.v1.request import Request
 
 # Sleep between retries of a full outbound queue: step metadata must not be
@@ -73,6 +90,104 @@ _LWD_RETIRED_CONNECTION_CAP = 4096
 
 
 _LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
+
+
+class LwdProbeQueryAdapter:
+    """Read-only hit query behind the HTTP probe commands.
+
+    The probe answers routing and hit-boundary questions only: reservations
+    and pinning stay with the data-plane request path (the single
+    reservation authority of ``LwdPrefixReservations.reserve`` in
+    add_request), so this adapter never pins blocks, never creates a
+    reservation and needs no TTL sweep — no orphan reservations can exist.
+    It links the probe manifest to the native ``find_longest_cache_hit``
+    and reports the answering engine's identity.
+    """
+
+    def __init__(
+        self,
+        manager: Any,
+        hash_block_size: int,
+        alignment_tokens: int,
+        instance_id: str,
+        cloud_id: int,
+        dp_idx: int,
+    ) -> None:
+        self._manager = manager
+        self._hash_block_size = int(hash_block_size or 0)
+        self._alignment_tokens = int(alignment_tokens or 0)
+        self._instance_id = instance_id
+        self._cloud_id = cloud_id
+        self._dp_idx = dp_idx
+
+    def probe(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
+        hash_bs = self._hash_block_size if self._hash_block_size > 0 else 1
+        hit = 0
+        manager = self._manager
+        hashes = list(getattr(manifest, "full_block_hashes", None) or [])
+        if manager is not None and self._hash_block_size > 0 and hashes:
+            # The manifest chain is at the cloud hash granularity (a
+            # multiple of hash_block_size); the native pool records blocks
+            # at the vllm block size, so expand by the ratio before the
+            # lookup.
+            native_bs = int(getattr(manager, "block_size", 0) or 0)
+            ratio = (
+                max(1, self._hash_block_size // native_bs)
+                if native_bs > 0 else 1
+            )
+            chain = (
+                [h for h in hashes for _ in range(ratio)]
+                if ratio > 1 else hashes
+            )
+            _groups, hit, _boundary = manager.coordinator.find_longest_cache_hit(
+                chain,
+                max_cache_hit_length=max(0, manifest.prompt_tokens - 1),
+            )
+        # Hits floor to whole cloud hash blocks: the edge builds and trims
+        # its chain at that granularity, and LwdProbeResult requires
+        # hit_tokens == hit_blocks * block_size.
+        hit = (int(hit) // hash_bs) * hash_bs
+        hit_blocks = hit // hash_bs
+        return LwdProbeResult(
+            request_id=manifest.request_id,
+            instance_id=self._instance_id,
+            block_size=hash_bs,
+            hit_blocks=hit_blocks,
+            hit_tokens=hit_blocks * hash_bs,
+            alignment_tokens=self._alignment_tokens,
+            cloud_id=self._cloud_id,
+            dp_idx=self._dp_idx,
+        )
+
+
+def _lwd_namescope_edge_message(
+    msg: LwdMessage, connection_id: LwdConnectionId
+) -> LwdMessage:
+    """Wrap every request id of an inbound edge message in the cloud namespace.
+
+    The single seam where wire ids become engine-internal ids: the ingest
+    thread calls it right after resolving the source connection, so the
+    scheduler, arrival ledgers, reservation keys and usage settlement all see
+    one collision-free key space even when two edges reuse one client id.
+    """
+    edge_id = connection_id.edge_id
+    if isinstance(msg, LwdRangeNotify):
+        if not msg.items:
+            return msg
+        return msgspec.structs.replace(
+            msg,
+            items=[
+                msgspec.structs.replace(
+                    item, request_id=lwd_wrap_request_id(edge_id, item.request_id)
+                )
+                for item in msg.items
+            ],
+        )
+    if isinstance(msg, (LwdRequestNotify, LwdAbortNotify)):
+        return msgspec.structs.replace(
+            msg, request_id=lwd_wrap_request_id(edge_id, msg.request_id)
+        )
+    return msg
 
 
 class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
@@ -168,6 +283,18 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 "compilation and the sampling bitmask happen on the cloud"
             )
         self._lwd_init_prefix_cache()
+        # Multi-edge flag of this DP rank: request ids stay unwrapped on the
+        # wire of a single-edge cloud (byte-identical to the pre-namespace
+        # format), while a multi-edge cloud must never see an unnamespaced
+        # id leaving the engine (it could not be attributed to a source).
+        dp_idx = self.vllm_config.parallel_config.data_parallel_index
+        self._lwd_multi_edge = len(
+            {
+                connection.connection_id.edge_id
+                for connection in self.lwd_config.connections
+                if connection.connection_id.dp_idx == dp_idx
+            }
+        ) > 1
         self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edge: LwdPeer | None = None
         self._lwd_peers: dict[LwdConnectionId, LwdPeer] = {}
@@ -213,6 +340,14 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
         self._lwd_ingest_thread.start()
         plane = self._lwd_start_control_plane()
+        # Coordination attributes exist before any thread starts, so the
+        # busy-loop guards hold even when coordination is disabled or the
+        # assembly fails halfway.
+        self._lwd_coordination_commands: queue.Queue | None = None
+        self._lwd_coordination_bridge: Any = None
+        self._lwd_coordination_processor: LwdCloudControlProcessor | None = None
+        self._lwd_coordination_query: LwdProbeQueryAdapter | None = None
+        self._lwd_setup_coordination()
         lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
 
     def _lwd_dp_coordinator_addr(self) -> str:
@@ -226,6 +361,163 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         dp_rank = self.vllm_config.parallel_config.data_parallel_index
         local = self.lwd_config.instance.dp[dp_rank]
         return f"tcp://{local.addr}:{port}"
+
+    def _lwd_setup_coordination(self) -> None:
+        """Start this engine's HTTP coordination endpoint and wire its
+        command queue into the step loop.
+
+        The server function owns the enabled/role checks: coordination off,
+        absent, or an edge role leaves every attribute empty and the engine
+        loop untouched (zero behavior change). With it armed, probe commands
+        are consumed by ``_lwd_poll_coordination`` on the engine thread —
+        the only thread allowed to touch the block pool — and usage events
+        are pushed back through the bridge at finish settlement.
+        """
+        coord_cfg = getattr(self.lwd_config, "coordination", None)
+        if coord_cfg is None or not coord_cfg.enabled:
+            return
+        command_queue: queue.Queue = queue.Queue()
+        event_queue: queue.Queue = queue.Queue()
+        bridge = lwd_start_cloud_control_server(
+            self.vllm_config,
+            command_queue=command_queue,
+            event_queue=event_queue,
+            wakeup=self._lwd_coordination_wakeup,
+        )
+        if bridge is None:
+            return
+        self._lwd_coordination_commands = command_queue
+        self._lwd_coordination_bridge = bridge
+        self._lwd_coordination_query = LwdProbeQueryAdapter(
+            manager=getattr(self.scheduler, "kv_cache_manager", None),
+            hash_block_size=self._lwd_hash_block_size,
+            alignment_tokens=(
+                self._lwd_prefix_state.alignment_tokens
+                if self._lwd_prefix_state is not None
+                else 0
+            ),
+            instance_id=str(
+                coord_cfg.instance_id or f"cloud-{self.lwd_config.instance_id}"
+            ),
+            cloud_id=self.lwd_config.instance_id,
+            dp_idx=self.vllm_config.parallel_config.data_parallel_index,
+        )
+        self._lwd_coordination_processor = LwdCloudControlProcessor(
+            command_queue, event_queue
+        )
+        lwd_logger.info(
+            "[coord] cloud engine coordination plane armed "
+            "(hash_block_size=%d, query=read-only)",
+            self._lwd_hash_block_size,
+        )
+
+    def _lwd_coordination_wakeup(self) -> None:
+        """Wake an idle engine for one pending coordination command.
+
+        The same primitive the shutdown signal path uses: the native WAKEUP
+        payload is a no-op whose only job is returning
+        ``_process_input_queue`` from its blocking wait, and the command
+        itself is consumed by the poll that follows. Multiple posts are
+        harmless.
+        """
+        # A shutdown race leaves the command queued; that is harmless.
+        with contextlib.suppress(Exception):
+            self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+    def _lwd_poll_coordination(self) -> None:
+        """Consume coordination commands (engine thread, non-blocking).
+
+        No reservation TTL sweep is needed: the read-only query creates no
+        reservations, so none can be orphaned.
+        """
+        processor = self._lwd_coordination_processor
+        if processor is None:
+            return
+        started = time.monotonic()
+        consumed = processor.poll(self._lwd_coordination_query)
+        if consumed:
+            lwd_logger.info(
+                "[coord] probe poll consumed=%d poll_ms=%.2f",
+                consumed,
+                (time.monotonic() - started) * 1000.0,
+            )
+
+    def _process_input_queue(self) -> None:
+        """Idle-wait override: with the coordination plane armed, one round
+        of probe commands is drained after every input-queue poll.
+
+        The query itself runs here on the engine thread: the block pool is
+        not thread-safe and the HTTP loop never touches it. Idle
+        reachability: every command posts a WAKEUP, so the native blocking
+        get returns immediately, and has_work counts the pending commands so
+        the blocking loop exits and reaches this poll.
+        """
+        if self._lwd_coordination_processor is None:
+            return super()._process_input_queue()
+        super()._process_input_queue()
+        self._lwd_poll_coordination()
+
+    def has_work(self) -> bool:
+        """Pending coordination commands count as work: the native
+        ``_process_input_queue`` blocks its wait loop while has_work is
+        false, and a WAKEUP alone does not end that loop — the queued
+        commands must hold the loop open until the poll consumes them (an
+        idle engine answers probes without waiting for a step)."""
+        commands = self._lwd_coordination_commands
+        return super().has_work() or (
+            commands is not None and not commands.empty()
+        )
+
+    def _lwd_publish_finished_usage(
+        self, engine_core_outputs: Any
+    ) -> dict[str, LwdUsage]:
+        """Settle finished requests onto the coordination SSE stream.
+
+        Token counts come from the scheduler's ``lwd_finished_records``
+        (captured by the ``_free_request`` choke point — abort and error
+        terminations land there too, so the ledger, not the output rows, is
+        the terminal-state authority); ``cached_tokens`` comes from the
+        reservation hit snapshot (the reservation itself was released at
+        first allocation, and reading it back would report zero — exactly
+        the bug the snapshot ledger fixes). Records are consumed here;
+        without a coordination bridge nothing is read or pushed.
+        """
+        bridge = self._lwd_coordination_bridge
+        if bridge is None:
+            return {}
+        records = getattr(self.scheduler, "lwd_finished_records", None) or {}
+        if not records:
+            return {}
+        finished: set[str] = set()
+        for outputs in engine_core_outputs.values():
+            for output in outputs.outputs:
+                if output.finish_reason is not None:
+                    finished.add(output.request_id)
+            for request_id in outputs.finished_requests or ():
+                finished.add(request_id)
+        # The ledger is the authority: outputs only cover rows carrying a
+        # terminal output; abort/error terminations emit no row at all.
+        finished |= set(records)
+        reservations = getattr(self.scheduler, "lwd_prefix_reservations", None)
+        usages: dict[str, LwdUsage] = {}
+        for request_id in finished:
+            snapshot = records.pop(request_id, None)
+            if snapshot is None:
+                continue
+            prompt_tokens, completion_tokens = snapshot
+            cached = (
+                reservations.cached_hit_of(request_id)
+                if reservations is not None
+                else 0
+            )
+            usage = LwdUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=int(cached or 0),
+            )
+            usages[request_id] = usage
+            bridge.publish_usage(request_id, usage)
+        return usages
 
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_edge_to_cloud(payload)
@@ -283,13 +575,21 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             raise RuntimeError(f"[LWD] request route missing for {request_id}")
         return self._lwd_peer_for_connection(connection_id)
 
+    def _lwd_wire_request_id(self, request_id: str) -> str:
+        """Restore the edge's original id for an outbound wire message."""
+        return lwd_unwrap_request_id(
+            request_id, multi_edge=getattr(self, "_lwd_multi_edge", False)
+        )
+
     def _lwd_send_prefix_ready(
         self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
     ) -> None:
         peer = self._lwd_peer_for_request(request_id)
         self._lwd_send_until_queued(
             peer,
-            LwdPrefixReadyNotify(request_id, hit_tokens, nonce, error),
+            LwdPrefixReadyNotify(
+                self._lwd_wire_request_id(request_id), hit_tokens, nonce, error
+            ),
         )
         lwd_logger.info(
             "[prefix] READY req=%s hit=%d nonce=%d error=%r",
@@ -305,7 +605,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         peer = self._lwd_peer_for_request(request_id)
         self._lwd_send_until_queued(
             peer,
-            LwdRefillNotify(request_id, start_row, end_row, prefix_nonce),
+            LwdRefillNotify(
+                self._lwd_wire_request_id(request_id),
+                start_row,
+                end_row,
+                prefix_nonce,
+            ),
         )
         lwd_logger.info(
             "[prefix] REFILL req=%s rows=[%d, %d) nonce=%d",
@@ -441,6 +746,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     ),
                 )
             return
+        msg = _lwd_namescope_edge_message(msg, connection_id)
         if isinstance(msg, LwdRangeNotify):
             self._lwd_handle_range_notify(msg, connection_id=connection_id)
         elif isinstance(msg, LwdRequestNotify):
@@ -815,17 +1121,22 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def step_with_batch_queue(self):
         """Drain the early-recv watermark at the head of the step (done
-        MQ -> gate readiness predicate); the rest is native."""
+        MQ -> gate readiness predicate); settle finished-request usage onto
+        the coordination stream; the rest is native."""
         self._lwd_drain_irecv_completions()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
+        if engine_core_outputs:
+            self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
 
     def step(self):
-        """Same for the synchronous step path: drain the watermark at
-        the head of the step, the rest is native."""
+        """Same for the synchronous step path: drain the watermark at the
+        head of the step, settle usage, the rest is native."""
         self._lwd_drain_irecv_completions()
         engine_core_outputs, model_executed = super().step()
+        if engine_core_outputs:
+            self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
 
@@ -1047,13 +1358,26 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Flush pending c2e to the edge at the end of the step (the
         scheduler only queues them; both native step paths reach this hook)."""
         if self.scheduler.pending_c2e:
+            multi_edge = getattr(self, "_lwd_multi_edge", False)
             finished_ids: list[str] = []
             for notify in self.scheduler.pending_c2e:
                 if not notify.req_ids:
                     continue
                 connection_id = self._lwd_notify_connection(notify)
                 peer = self._lwd_peer_for_connection(connection_id)
-                self._lwd_send_until_queued(peer, notify)
+                # Wire ids leave the engine namespaced ledgers only here:
+                # resolve the source connection while the internal ids are
+                # still intact, then restore the edge's original ids.
+                self._lwd_send_until_queued(
+                    peer,
+                    msgspec.structs.replace(
+                        notify,
+                        req_ids=[
+                            lwd_unwrap_request_id(request_id, multi_edge=multi_edge)
+                            for request_id in notify.req_ids
+                        ],
+                    ),
+                )
                 for index, request_id in enumerate(notify.req_ids):
                     if (
                         notify.finish_reasons

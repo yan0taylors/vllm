@@ -17,6 +17,12 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
+# Bound of the cached-hit snapshot ledger: entries survive their
+# reservation (released at first allocation) until the usage settlement
+# reads them; the bound evicts the oldest residue.
+_LWD_HIT_SNAPSHOT_CAP = 1024
+_LWD_HIT_SNAPSHOT_EVICT = 256
+
 
 class _LwdPrefixReservation(NamedTuple):
     groups: tuple[Sequence[KVCacheBlock], ...]
@@ -30,6 +36,11 @@ class LwdPrefixReservations:
     def __init__(self, manager: KVCacheManager) -> None:
         self.manager = manager
         self._reservations: dict[str, _LwdPrefixReservation] = {}
+        # Hit snapshots outliving their reservation: the usage settlement
+        # happens after the release (first allocation hands the blocks to
+        # the native request chain), so hit_of would report zero exactly
+        # when a successful request needs its cached_tokens accounted.
+        self._hit_snapshots: dict[str, int] = {}
         manager.lwd_prefix_reservations = self
         manager.lwd_prefix_caching = True
 
@@ -99,11 +110,48 @@ class LwdPrefixReservations:
             for group, manager in zip(groups, managers, strict=True)
         )
 
-    def release(self, request_id: str) -> None:
-        """Release a reservation and its pins; repeated calls are no-ops."""
+    def release(self, request_id: str, *, allocated: bool = False) -> None:
+        """Release a reservation and its pins; repeated calls are no-ops.
+
+        ``allocated=True`` marks the first-successful-allocation release
+        (the scheduler releases a request it just scheduled): the hit is
+        frozen into the snapshot ledger for the later usage settlement.
+        The remaining release sites (finish/abort cleanup, admission
+        rollback) drop the reservation without a snapshot — a request that
+        never consumed its blocks reports zero cached tokens.
+        """
         entry = self._reservations.pop(request_id, None)
-        if entry is not None and entry.pinned:
+        if entry is None:
+            return
+        if allocated:
+            self._hit_snapshots[request_id] = entry.hit_tokens
+            if len(self._hit_snapshots) > _LWD_HIT_SNAPSHOT_CAP:
+                for stale in list(self._hit_snapshots)[
+                    :_LWD_HIT_SNAPSHOT_EVICT
+                ]:
+                    self._hit_snapshots.pop(stale, None)
+                # Lazy import: this module stays free of runtime vllm
+                # imports so CPU tests can load it directly (the eviction
+                # path runs at most once per thousand requests).
+                from vllm.lwd_logger import lwd_logger
+
+                lwd_logger.warning(
+                    "[prefix] hit snapshot ledger full; evicted the oldest"
+                )
+        if entry.pinned:
             self.manager.block_pool.free_blocks(entry.pinned)
+
+    def cached_hit_of(self, request_id: str) -> int:
+        """Frozen hit of a request whose reservation is already released.
+
+        The usage settlement reads this after finish/abort: the reservation
+        itself is gone by then (hit_of would report zero), but the blocks
+        the request actually consumed from the cache stay accounted. A
+        request never scheduled (aborted before its first allocation) has
+        no snapshot and reports zero — an honest number, since its pinned
+        blocks were never used for compute.
+        """
+        return self._hit_snapshots.get(request_id, 0)
 
     def has(self, request_id: str) -> bool:
         return request_id in self._reservations
