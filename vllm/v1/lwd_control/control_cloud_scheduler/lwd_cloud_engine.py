@@ -23,6 +23,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+import msgspec
 import torch
 
 from vllm.config.lwd import LwdConnectionId
@@ -34,6 +35,7 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    LwdProbeQueryAdapter,
     init_lwd_prefix_cache,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
@@ -43,9 +45,11 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
+from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
     LwdAbortNotify,
+    LwdC2eNotify,
     LwdCloudParamsNotify,
     LwdCloudToEdgeMessage,
     LwdEdgeToCloudMessage,
@@ -63,10 +67,39 @@ from vllm.v1.request import Request
 # Sleep between retries of a full outbound queue: step metadata must not be
 # lost, the edge posts its receive of the exact size from it.
 _LWD_SEND_RETRY_SLEEP_S = 0.05
-_LWD_INGEST_JOIN_TIMEOUT_S = 5.0
+_LWD_RETIRED_ROUTE_CAP = 4096
+# Debug-level cloud concurrency snapshot interval.
+_LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
 
 
-_LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
+def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None:
+    """Full-payload log of one cloud->edge control-plane message once queued
+    for the peer; pairs with the edge-side `[edge] c2e received` log. The
+    per-step c2e notify gets per-row detail (top tree / token payloads are
+    reduced to lengths to bound log volume)."""
+    if isinstance(message, LwdC2eNotify):
+        lwd_logger.info(
+            "[cloud] c2e sent to edge %s seqno=%d reqs=%d hidden_numel=%d "
+            "req_ids=%s accepted=%s finish=%s nonces=%s top_tree_lens=%s "
+            "token_lens=%s",
+            peer,
+            message.down_seqno,
+            len(message.req_ids),
+            message.hidden_num_elements,
+            message.req_ids,
+            message.num_accepted_tokens,
+            message.finish_reasons,
+            message.prefix_nonces,
+            [len(top) for top in message.top_id_ths],
+            [len(tokens) for tokens in message.token_ids],
+        )
+    else:
+        lwd_logger.info(
+            "[cloud] %s sent to edge %s: %s",
+            type(message).__name__,
+            peer,
+            message,
+        )
 
 
 class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
@@ -163,8 +196,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 "compilation and the sampling bitmask happen on the cloud"
             )
         self._lwd_init_prefix_cache()
-        self._lwd_ingest_thread: threading.Thread | None = None
-        self._lwd_edge: LwdPeer | None = None
         self._lwd_edges: set[LwdPeer] = set()
         self._lwd_prompt_lens: dict[str, int] = {}
         self._lwd_retired_prompt_lens: dict[str, int] = {}
@@ -172,12 +203,66 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_retired_nonces: dict[str, int] = {}
         self._lwd_retired_req_ids: set[str] = set()
         self._lwd_rejected_nonces: dict[str, int] = {}
+        self._lwd_request_routes: dict[str, LwdPeer] = {}
+        self._lwd_retired_routes: dict[str, LwdPeer] = {}
         self._lwd_pending_seqnos: dict[
             LwdConnectionId, dict[int, set[str]]
         ] = {}
         self._lwd_request_seqnos: dict[str, set[int]] = {}
         self._lwd_latest_seqnos: dict[LwdConnectionId, int] = {}
         self._lwd_failed_connections: set[LwdConnectionId] = set()
+        self.scheduler.lwd_hash_block_size = self._lwd_hash_block_size
+        self._lwd_prefix_hits: dict[str, int] = {}
+        prefix_hash_block_size = self._lwd_hash_block_size
+        coordination = self.lwd_config.coordination
+        self._lwd_probe_query = None
+        # The probe query serves probes whenever coordination is enabled,
+        # NOT only with prefix caching: probe replies also carry placement
+        # and routing data (engine_index / cloud_id) plus health
+        # bookkeeping, which must keep flowing with prefix caching off.
+        # With caching disabled the NoPrefixCache KV coordinator returns an
+        # empty hit, so probes answer with zero hits instead of hanging in
+        # a consumer-less HTTP command queue until the 20s timeout.
+        if coordination is not None and coordination.enabled:
+            self._lwd_probe_query = LwdProbeQueryAdapter(
+                manager=self.scheduler.kv_cache_manager,
+                hash_block_size=self._lwd_hash_block_size,
+                alignment_tokens=self._lwd_prefix_state.alignment_tokens,
+                instance_id=f"cloud-{self.lwd_config.instance_id}",
+                cloud_id=self.lwd_config.instance_id,
+                # With caching off the query only carries placement/health;
+                # the manifest chain is built at the edge's own granularity,
+                # so the cloud hash-block-size contract does not apply.
+                prefix_caching=self._lwd_prefix_enabled,
+            )
+        self.scheduler.lwd_prefix_hits = self._lwd_prefix_hits
+        self._lwd_coord_pending: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._lwd_control_processor = None
+        self.cloud_control_event_queue = getattr(
+            self, "cloud_control_event_queue", None
+        )
+        command_queue = getattr(self, "cloud_control_command_queue", None)
+        if self._lwd_probe_query is not None:
+            if command_queue is None or self.cloud_control_event_queue is None:
+                raise RuntimeError(
+                    "[LWD] prefix caching requires HTTP coordination queues"
+                )
+            from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control import (
+                LwdCloudControlProcessor,
+            )
+
+            self._lwd_control_processor = LwdCloudControlProcessor(
+                self._lwd_coord_pending, self.cloud_control_event_queue
+            )
+            threading.Thread(
+                target=self._lwd_coord_wake_loop,
+                name="lwd-ctrl-wake",
+                daemon=True,
+            ).start()
+        self._lwd_cloud_conc_last_log = 0.0
+        self._lwd_engine_index = int(
+            self.vllm_config.parallel_config.data_parallel_index
+        )
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits are checked by the edge. The coordinator address
         # lets the edge
@@ -193,19 +278,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             prefix_alignment_tokens=self._lwd_prefix_state.alignment_tokens,
             prefix_alignment_required=self._lwd_prefix_state.alignment_required,
             prefix_use_eagle=self._lwd_prefix_state.use_eagle,
-            prefix_hash_block_size=self._lwd_hash_block_size,
+            prefix_hash_block_size=prefix_hash_block_size,
         )
         self._lwd_register_recv_hint()
-        # Edge messages are handled off the IO thread: building a request
-        # allocates its placeholder embeds and the pre-recv hint may block,
-        # which must not delay step metadata going out.
-        self._lwd_ingest_queue: queue.SimpleQueue[_LwdIngestItem | None] = (
-            queue.SimpleQueue()
-        )
-        self._lwd_ingest_thread = threading.Thread(
-            target=self._lwd_ingest_loop, name="lwd-cloud-ingest", daemon=True
-        )
-        self._lwd_ingest_thread.start()
+        # Business messages are handed to the engine input queue. Request,
+        # reservation, routing and coordinator state therefore have one owner:
+        # the engine thread, same as the native scheduler and KV manager.
         plane = self._lwd_start_control_plane()
         lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
 
@@ -224,15 +302,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_edge_to_cloud(payload)
 
-    def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
-        return LwdConnectionId(
-            peer.instance_id, self.lwd_config.instance_id, peer.dp_rank
-        )
-
     def _lwd_handle_peer_registered(self, peer: LwdPeer) -> None:
         """Engine thread: remember the edge and send it the scheduling
         limits before anything else."""
-        self._lwd_edge = peer
         self._lwd_edges.add(peer)
         self._lwd_send_until_queued(peer, self._lwd_cloud_params)
         lwd_logger.info(
@@ -257,14 +329,19 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 )
                 return
             time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+        _lwd_log_sent_to_edge(peer, message)
 
     def _lwd_send_prefix_ready(
         self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
     ) -> None:
-        assert self._lwd_edge is not None, "prefix reply before edge registration"
+        peer = self._lwd_request_routes.get(request_id)
+        if peer is None:
+            raise RuntimeError(f"[LWD] prefix reply route missing for {request_id}")
         self._lwd_send_until_queued(
-            self._lwd_edge,
-            LwdPrefixReadyNotify(request_id, hit_tokens, nonce, error),
+            peer,
+            LwdPrefixReadyNotify(
+                unwrap_req_id(request_id), hit_tokens, nonce, error
+            ),
         )
         lwd_logger.info(
             "[prefix] READY req=%s hit=%d nonce=%d error=%r",
@@ -277,10 +354,14 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_send_refill(
         self, request_id: str, start_row: int, end_row: int, prefix_nonce: int
     ) -> None:
-        assert self._lwd_edge is not None, "refill before edge registration"
+        peer = self._lwd_request_routes.get(request_id)
+        if peer is None:
+            raise RuntimeError(f"[LWD] refill route missing for {request_id}")
         self._lwd_send_until_queued(
-            self._lwd_edge,
-            LwdRefillNotify(request_id, start_row, end_row, prefix_nonce),
+            peer,
+            LwdRefillNotify(
+                unwrap_req_id(request_id), start_row, end_row, prefix_nonce
+            ),
         )
         lwd_logger.info(
             "[prefix] REFILL req=%s rows=[%d, %d) nonce=%d",
@@ -336,6 +417,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 request_id, 0, nonce, error="cloud admission failed"
             )
             raise
+        self._lwd_prefix_hits[request_id] = hit_tokens
         self._lwd_send_prefix_ready(request_id, hit_tokens, nonce)
 
     def _lwd_register_recv_hint(self) -> None:
@@ -371,22 +453,38 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
 
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
-        """IO thread: hand all edge business notifies to the ingest thread."""
-        if not isinstance(msg, (LwdRangeNotify, LwdRequestNotify, LwdAbortNotify)):
+        """IO thread: preserve order and hand business messages to the engine."""
+        if not isinstance(
+            msg,
+            (
+                LwdRangeNotify,
+                LwdRequestNotify,
+                LwdAbortNotify,
+            ),
+        ):
             return False
-        self._lwd_ingest_queue.put((peer, msg))
+        self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, (peer, msg)))
         return True
 
-    def _lwd_ingest_loop(self) -> None:
-        while (item := self._lwd_ingest_queue.get()) is not None:
+    def _handle_client_request(
+        self, request_type: EngineCoreRequestType, request: Any
+    ) -> None:
+        if (
+            request_type == EngineCoreRequestType.WAKEUP
+            and isinstance(request, tuple)
+            and len(request) == 2
+            and isinstance(request[0], LwdPeer)
+        ):
+            peer, msg = request
             try:
-                self._lwd_handle_edge_message(*item)
-            except Exception as e:
+                self._lwd_handle_edge_message(peer, msg)
+            except Exception as exc:
                 lwd_logger.exception(
-                    "[cloud] ingest of %s failed", type(item[1]).__name__
+                    "[cloud] ingest of %s failed", type(msg).__name__
                 )
-                self._lwd_fail(f"ingest of {type(item[1]).__name__}: {e!r}")
-                return
+                self._lwd_fail(f"ingest of {type(msg).__name__}: {exc!r}")
+            return
+        super()._handle_client_request(request_type, request)
 
     def _lwd_handle_edge_message(
         self, peer: LwdPeer, msg: LwdEdgeToCloudMessage
@@ -413,11 +511,33 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 )
             return
         if isinstance(msg, LwdRangeNotify):
+            # Every request id in the batch enters the cloud namespace once.
+            msg = msgspec.structs.replace(
+                msg,
+                items=[
+                    msgspec.structs.replace(
+                        item, request_id=wrap_req_id(peer.instance_id, item.request_id)
+                    )
+                    for item in msg.items
+                ],
+            )
             self._lwd_handle_range_notify(connection_id, msg)
-        elif isinstance(msg, LwdRequestNotify):
+            return
+        if not isinstance(msg, (LwdRequestNotify, LwdAbortNotify)):
+            return
+        canonical_id = wrap_req_id(peer.instance_id, msg.request_id)
+        msg = msgspec.structs.replace(msg, request_id=canonical_id)
+        if isinstance(msg, LwdRequestNotify):
+            self._lwd_retired_routes.pop(canonical_id, None)
+            self._lwd_request_routes[canonical_id] = peer
             self._lwd_handle_request_notify(msg)
-        elif isinstance(msg, LwdAbortNotify):
+        else:
             self._lwd_handle_abort_notify(msg)
+
+    def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
+        return LwdConnectionId(
+            peer.instance_id, self.lwd_config.instance_id, peer.dp_rank
+        )
 
     def _lwd_handle_range_notify(
         self, connection_id: LwdConnectionId, notify: LwdRangeNotify
@@ -527,26 +647,26 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             current is not None and current != notify.prefix_nonce
         ):
             self._lwd_rejected_nonces[request_id] = notify.prefix_nonce
-            self._lwd_send_prefix_ready(
-                request_id,
-                0,
-                notify.prefix_nonce,
-                error="request id reused before previous generation drained",
+            if notify.prefix_nonce:
+                self._lwd_send_prefix_ready(
+                    request_id,
+                    0,
+                    notify.prefix_nonce,
+                    error="request id reused before previous generation drained",
+                )
+                return
+            raise RuntimeError(
+                f"[LWD] request_id {request_id} reused before previous generation drained"
             )
-            lwd_logger.warning(
-                "[cloud] reject early reuse req=%s nonce=%d",
-                request_id,
-                notify.prefix_nonce,
-            )
-            return
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
-        self._lwd_request_nonces[request_id] = notify.prefix_nonce
+        if notify.prefix_nonce:
+            self._lwd_request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
         if request.use_structured_output:
-            # Wire-rebuilt requests bypass the native auto-compile entry
-            # (core.py::preprocess_add_request); without this explicit init
-            # the request would sit in WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
-            # forever with no error.
+            # This path constructs Request directly and therefore bypasses
+            # EngineCore.preprocess_add_request, the native grammar-init hook;
+            # without this explicit init the request would sit in
+            # WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR forever with no error.
             self.structured_output_manager.grammar_init(request)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
         lwd_logger.info(
@@ -555,7 +675,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             notify.num_prompt_tokens,
             notify.prefix_nonce,
         )
-        if not self.engines_running:
+        # A coordinated MoE DP engine must let the native ADD path observe the
+        # paused state and emit start_wave. Waking only this rank here suppresses
+        # that notification and can leave its peers asleep for the next collective.
+        native_dp_wake = isinstance(self, DPEngineCoreProc) and self.has_coordinator
+        if not self.engines_running and not native_dp_wake:
             self.engines_running = True
             lwd_logger.info(
                 "[cloud] first request wakes a paused wave (local fallback)"
@@ -566,21 +690,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         current = getattr(self, "_lwd_request_nonces", {}).get(request_id)
         retired = getattr(self, "_lwd_retired_nonces", {}).get(request_id)
         if request_id in self._lwd_retired_req_ids and retired == notify.prefix_nonce:
-            lwd_logger.info(
-                "[cloud] ignore duplicate abort req=%s nonce=%d",
-                request_id,
-                notify.prefix_nonce,
-            )
             return
         if (
             getattr(self, "_lwd_rejected_nonces", {}).get(request_id)
             == notify.prefix_nonce
         ):
-            lwd_logger.info(
-                "[cloud] ignore abort for rejected generation req=%s nonce=%d",
-                request_id,
-                notify.prefix_nonce,
-            )
             return
         if current is not None and current != notify.prefix_nonce:
             lwd_logger.warning(
@@ -591,12 +705,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
             return
         if current is None and retired is not None and retired != notify.prefix_nonce:
-            lwd_logger.warning(
-                "[cloud] ignore stale abort req=%s nonce=%d retired=%d",
-                request_id,
-                notify.prefix_nonce,
-                retired,
-            )
             return
         if current is None and retired is None and notify.prefix_nonce != 0:
             lwd_logger.warning(
@@ -605,6 +713,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 notify.prefix_nonce,
             )
             return
+        self.scheduler._lwd_refill_gate.discard(request_id)
+        self.scheduler._lwd_refill_pending.pop(request_id, None)
+        reservations = getattr(self.scheduler, "lwd_prefix_reservations", None)
+        if reservations is not None:
+            reservations.release(request_id)
         self._lwd_retire_request(request_id, preserve_prompt=True)
         lwd_logger.info(
             "[cloud] abort req=%s nonce=%d", request_id, notify.prefix_nonce
@@ -631,6 +744,18 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 self._lwd_retired_prompt_lens[request_id] = prompt_len
 
     def _lwd_clear_retired(self, request_id: str) -> None:
+        if any(request_id in notify.req_ids for notify in self.scheduler.pending_c2e):
+            # A final or zero-accepted notification still needs the original
+            # route. Keep the tombstone until post_step has flushed it.
+            self._lwd_retired_req_ids.add(request_id)
+            return
+        route = self._lwd_request_routes.pop(request_id, None)
+        if route is not None:
+            # DOWN metadata can trail native request retirement by one or more
+            # asynchronous steps. Keep a bounded tombstone for those batches.
+            self._lwd_retired_routes[request_id] = route
+            while len(self._lwd_retired_routes) > _LWD_RETIRED_ROUTE_CAP:
+                self._lwd_retired_routes.pop(next(iter(self._lwd_retired_routes)))
         self._lwd_retired_req_ids.discard(request_id)
         self._lwd_retired_prompt_lens.pop(request_id, None)
         getattr(self, "_lwd_retired_nonces", {}).pop(request_id, None)
@@ -640,14 +765,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         getattr(self, "_lwd_rejected_nonces", {}).pop(request_id, None)
 
     def shutdown(self) -> None:
-        # Before the executor goes: a pre-recv hint blocks on its queue.
-        if self._lwd_ingest_thread is not None:
-            self._lwd_ingest_queue.put(None)
-            self._lwd_ingest_thread.join(_LWD_INGEST_JOIN_TIMEOUT_S)
         super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
-        """Build a placeholder request whose initial hashes come from the edge."""
+        """Build a placeholder request and adopt the edge's native wire hashes
+        for single-instance prefix negotiation."""
         sampling_params = self._lwd_build_sampling_params(req_notify)
         prompt_embeds = torch.empty(
             req_notify.num_prompt_tokens,
@@ -666,14 +788,20 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         def block_hasher(request: Request) -> list[bytes]:
             if request.num_output_tokens > 0:
                 return []
+            # The cloud holds only a meta placeholder for the prompt
+            # embeddings (the real rows arrive later over the UP channel), so
+            # a local token/embedding hash raises "Cannot copy out of meta
+            # tensor".  Adopt the edge's wire chain only when it matches the
+            # cloud hash granularity; otherwise leave the request without
+            # hashes and let add_request fail closed through
+            # lwd_wire_hashes_adopted.
             if (
                 local_hasher is not None
                 and not request.block_hashes
                 and len(req_notify.block_hashes) == expected
             ):
                 return list(req_notify.block_hashes)
-            assert local_hasher is not None
-            return local_hasher(request)
+            return []
 
         request = Request(
             request_id=req_notify.request_id,
@@ -685,9 +813,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
         request.lwd_mrope_positions = req_notify.mrope_positions
         request.lwd_prefix_nonce = req_notify.prefix_nonce
+        request.lwd_prefix_probe_succeeded = req_notify.prefix_probe_succeeded
         request.lwd_wire_hashes_adopted = (
             local_hasher is not None and len(req_notify.block_hashes) == expected
         )
+        request.block_hashes = list(req_notify.block_hashes)
         return request
 
     @staticmethod
@@ -715,21 +845,78 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)
         return sampling_params
 
+    def _lwd_coord_wake_loop(self) -> None:
+        """Move MP commands to a local queue and wake the engine thread."""
+        command_queue = self.cloud_control_command_queue
+        while True:
+            try:
+                command = command_queue.get()
+            except (EOFError, OSError):
+                return
+            self._lwd_coord_pending.put(command)
+            self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+    def _lwd_poll_coordination(self) -> None:
+        probe_query = getattr(self, "_lwd_probe_query", None)
+        if probe_query is None:
+            return
+        processor = getattr(
+            self, "cloud_control_processor", self._lwd_control_processor
+        )
+        if processor is not None:
+            processor.poll(probe_query)
+
+    def has_work(self) -> bool:
+        # Native WAKEUP reevaluates this predicate even when the scheduler is
+        # idle, giving pending HTTP probe commands a non-blocking poll point.
+        self._lwd_poll_coordination()
+        return super().has_work()
+
     def step_with_batch_queue(self):
         """Drain the early-recv watermark at the head of the step (done
         MQ -> gate readiness predicate); the rest is native."""
+        self._lwd_poll_coordination()
         self._lwd_drain_irecv_completions()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
+        self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
 
     def step(self):
         """Same for the synchronous step path: drain the watermark at
         the head of the step, the rest is native."""
+        self._lwd_poll_coordination()
         self._lwd_drain_irecv_completions()
         engine_core_outputs, model_executed = super().step()
+        self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
+
+    def _lwd_publish_finished_usage(self, engine_core_outputs: Any) -> None:
+        records = self.scheduler.lwd_finished_records
+        event_queue = getattr(
+            self, "cloud_control_event_queue", self.cloud_control_event_queue
+        )
+        from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdUsage
+
+        for request_id, (prompt_tokens, completion_tokens) in list(records.items()):
+            cached_tokens = self._lwd_prefix_hits.get(request_id, 0)
+            usage = LwdUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+            )
+            if event_queue is not None:
+                event_queue.put(
+                    {
+                        "type": "usage",
+                        "request_id": request_id,
+                        "usage": usage,
+                        "engine_index": self._lwd_engine_index,
+                    }
+                )
+            records.pop(request_id, None)
+            self._lwd_prefix_hits.pop(request_id, None)
 
     def _lwd_retire_finished_outputs(self, engine_core_outputs: Any) -> None:
         if not engine_core_outputs:
@@ -825,11 +1012,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             seqno,
             error,
         )
-        request_ids = {
+        request_ids = [
             request_id
-            for pending in self._lwd_pending_seqnos.get(connection, {}).values()
-            for request_id in pending
-        }
+            for request_id, peer in self._lwd_request_routes.items()
+            if self._lwd_connection_of(peer) == connection
+        ]
         for request_id in request_ids:
             self._lwd_retire_request(request_id, preserve_prompt=True)
             self.aborts_queue.put_nowait([request_id])
@@ -865,14 +1052,68 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if touched:
             lwd_logger.info("[cloud] arrival high watermarks updated: %s", touched)
 
+    def _lwd_log_cloud_concurrency(self) -> None:
+        """Debug-level snapshot of this engine's concurrency: how many
+        requests it is running right now, plus the backlog and the KV
+        cache occupancy they hold."""
+        now = time.monotonic()
+        if now - self._lwd_cloud_conc_last_log < _LWD_CLOUD_CONC_LOG_INTERVAL_S:
+            return
+        self._lwd_cloud_conc_last_log = now
+        scheduler = self.scheduler
+        block_pool = scheduler.kv_cache_manager.block_pool
+        lwd_logger.debug(
+            "[Lwd][dbg] cloud concurrency cloud_id=%d engine=%d running=%d "
+            "waiting=%d skipped=%d total=%d step=%d | kv_cache usage=%.1f%% "
+            "free=%d total=%d",
+            self.lwd_config.instance_id,
+            self._lwd_engine_index,
+            len(scheduler.running),
+            len(scheduler.waiting),
+            len(scheduler.skipped_waiting),
+            len(scheduler.requests),
+            scheduler.current_step,
+            block_pool.get_usage() * 100.0,
+            block_pool.get_num_free_blocks(),
+            max(0, block_pool.num_gpu_blocks - 1),
+        )
+
     def post_step(self, model_executed: bool) -> None:
         """Flush pending c2e to the edge at the end of the step (the
         scheduler only queues them; both native step paths reach this hook)."""
+        self._lwd_log_cloud_concurrency()
         if self.scheduler.pending_c2e:
-            assert self._lwd_edge is not None, "c2e produced before any edge"
+            finished_ids: list[str] = []
             for notify in self.scheduler.pending_c2e:
-                self._lwd_send_until_queued(self._lwd_edge, notify)
+                if not notify.req_ids:
+                    continue
+                peers = {
+                    self._lwd_request_routes.get(request_id)
+                    or self._lwd_retired_routes.get(request_id)
+                    for request_id in notify.req_ids
+                }
+                if len(peers) != 1 or None in peers:
+                    raise RuntimeError(
+                        "[LWD] one C2E batch must have exactly one known source edge"
+                    )
+                peer = next(iter(peers))
+                assert peer is not None
+                restored = msgspec.structs.replace(
+                    notify,
+                    req_ids=[unwrap_req_id(request_id) for request_id in notify.req_ids],
+                )
+                self._lwd_send_until_queued(peer, restored)
+                # Finished routes stay pinned until every pending C2E has
+                # flushed; later zero-accepted/retirement notices are legal.
+                for index, request_id in enumerate(notify.req_ids):
+                    if (
+                        notify.finish_reasons
+                        and notify.finish_reasons[index] != -1
+                    ):
+                        finished_ids.append(request_id)
             self.scheduler.pending_c2e.clear()
+            for request_id in finished_ids:
+                self._lwd_clear_retired(request_id)
         super().post_step(model_executed)
 
 

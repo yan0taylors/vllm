@@ -88,6 +88,8 @@ def _scheduler(request) -> LwdCloudScheduler:
     scheduler._lwd_prefix_enabled = False
     scheduler._lwd_refill_gate = set()
     scheduler._lwd_refill_pending = {}
+    scheduler._lwd_prefill_group_cursor = 0
+    scheduler.lwd_prefix_hits = {}
     return scheduler
 
 
