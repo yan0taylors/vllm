@@ -122,6 +122,41 @@ def test_single_instance_multi_dp_serves_every_cloud_dp_from_one_edge() -> None:
     assert spec.channel_endpoints_of(2) == ()
 
 
+def test_edge_share_serves_each_cloud_from_the_shared_edge_rank() -> None:
+    spec = LwdParallelGroupsSpec.from_topology(
+        _topology(
+            "edge_share",
+            [
+                _instance(0, [[0]], cloud=False, addr="10.0.0.1"),
+                _instance(1, [[0]], cloud=False, addr="10.0.0.1"),
+            ],
+            [
+                _instance(0, [[1]], cloud=True, addr="10.1.0.1"),
+                _instance(1, [[2]], cloud=True, addr="10.1.0.2"),
+            ],
+            [(0, 0), (1, 1)],
+        )
+    )
+
+    # The shared edge rank holds both one-to-one channels; each cloud keeps
+    # its own leader-rank endpoint.
+    assert spec.world_size == 3
+    assert spec.channel_endpoints == (
+        LwdChannelEndpoints(LwdConnectionId(0, 0, 0), 0, 1),
+        LwdChannelEndpoints(LwdConnectionId(1, 1, 0), 0, 2),
+    )
+    assert spec.channel_endpoints_of(0) == (
+        LwdChannelEndpoints(LwdConnectionId(0, 0, 0), 0, 1),
+        LwdChannelEndpoints(LwdConnectionId(1, 1, 0), 0, 2),
+    )
+    assert spec.channel_endpoints_of(1) == (
+        LwdChannelEndpoints(LwdConnectionId(0, 0, 0), 0, 1),
+    )
+    assert spec.channel_endpoints_of(2) == (
+        LwdChannelEndpoints(LwdConnectionId(1, 1, 0), 0, 2),
+    )
+
+
 def test_full_mesh_cluster_connects_every_edge_to_every_cloud() -> None:
     spec = LwdParallelGroupsSpec.from_topology(
         _topology(
