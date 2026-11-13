@@ -118,6 +118,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # this edge connects to several clouds.
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
+        self._lwd_instance_id = lwd_config.instance_id
+        self._lwd_edge_share = (
+            lwd_config.topology.deployment.scene == "edge_share"
+        )
         connections = tuple(
             sorted(c.connection_id for c in lwd_config.connections)
         )
@@ -139,7 +143,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # block hash chain for cloud-side hits.
         self.kv_cache_manager.enable_caching = False
         # c2e notify queue: appended by the control-plane IO thread with the
-        # delivering link's connection, consumed within a scheduling step to
+        # delivering link's dp_idx, consumed within a scheduling step to
         # produce an UNEMBED batch
         self.unembed_notify_queue: deque[
             tuple[LwdConnectionId, LwdC2eNotify]
@@ -175,29 +179,49 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         account.prefix_alignment_required = params.prefix_alignment_required
 
     def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
-        """Routed connection of an active request; unrouted ids are a bug."""
+        """Routed dp_idx of an active request; unrouted ids are a bug."""
         return self._lwd_route[request_id]
 
     def _lwd_dp_of_settling(self, request_id: str) -> LwdConnectionId | None:
-        """Routed connection, None for a request that already left the books
+        """Routed dp_idx, None for a request that already left the books
         (a late result racing its own finish)."""
         return self._lwd_route.get(request_id)
 
+    def _lwd_edge_id_of(self, request: Request) -> int:
+        """Logical edge id owning the request. In edge_share the shared edge
+        engine serves every logical frontend, whose identity is the attach
+        client_index; a standalone edge process owns exactly its
+        instance_id."""
+        if self._lwd_edge_share:
+            return request.client_index
+        return self._lwd_instance_id
+
     def _lwd_route_request(
-        self, request_id: str, preferred: LwdConnectionId | None = None
+        self, request_id: str, edge_id: int, preferred: LwdConnectionId | None = None
     ) -> LwdConnectionId:
-        """Pick and pin the target connection: a healthy preferred route
-        wins when supplied, otherwise the score weighs prefill 4 and decode
-        1 (the same weights as the native DP load balancer) and ties rotate
-        from the last served connection."""
+        """Pick and pin the target connection for the requesting edge. Only
+        connections originating at edge_id are candidates (the shared
+        edge_share engine would otherwise balance every logical edge's
+        request across every cloud); a healthy preferred route wins when
+        supplied, otherwise score and ordered round-robin decide."""
         accounts = self._lwd_accounts
-        if preferred is not None and preferred in accounts:
-            best = accounts[preferred]
-        elif len(accounts) == 1:
-            best = next(iter(accounts.values()))
+        candidates = {
+            connection_id: accounts[connection_id]
+            for connection_id in self._lwd_connections
+            if connection_id.edge_id == edge_id
+        }
+        if not candidates:
+            raise RuntimeError(
+                f"[LWD] no cloud connection for edge_id={edge_id} "
+                f"(request {request_id})"
+            )
+        if preferred is not None and preferred in candidates:
+            best = candidates[preferred]
+        elif len(candidates) == 1:
+            best = next(iter(candidates.values()))
         else:
             best = min(
-                accounts.values(),
+                candidates.values(),
                 key=lambda account: (
                     account.score(),
                     (
@@ -212,8 +236,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_route[request_id] = connection_id
         best.note_prefill_admitted(request_id)
         lwd_logger.info(
-            "[edge-route] req=%s -> %s (score=%d loads=%s)",
+            "[edge-route] req=%s edge=%d -> %s (score=%d loads=%s)",
             request_id,
+            edge_id,
             connection_id,
             best.score(),
             [(a.prefill_load, a.decode_load) for a in accounts.values()],
@@ -259,10 +284,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return self._lwd_schedule_unembed()
 
     def _lwd_pick_serving_engine(self) -> LwdConnectionId | None:
-        """The connection this step serves: one that has routed work and
-        passes its gate, rotating in connection order so a busy connection
-        never starves the others. None when every connection with work is
-        gated or there is no work at all."""
+        """Pick the next ungated connection with routed work in stable order."""
         routed = set(self._lwd_route.values())
         if not routed:
             return None
@@ -363,8 +385,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 if key[0] != dp_idx or key[1] > watermark
             }
         batch = getattr(scheduler_output, "lwd_batch", None)
-        outputs: list[EngineCoreOutput] = []
-        finished: set[str] = set()
+        outputs: dict[int, list[EngineCoreOutput]] = {}
+        finished: dict[int, set[str]] = {}
         if batch is not None and batch.batch_type == LwdBatchType.LWD_UNEMBED:
             notify = scheduler_output.lwd_c2e_notify[0]
             req_ids = getattr(model_runner_output, "req_ids", None) or ()
@@ -385,10 +407,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if not outputs:
             return {}
         return {
-            0: EngineCoreOutputs(
-                outputs=outputs,
-                finished_requests=finished or None,
+            client_index: EngineCoreOutputs(
+                outputs=outs,
+                finished_requests=finished.get(client_index) or None,
             )
+            for client_index, outs in outputs.items()
         }
 
     @staticmethod
@@ -418,13 +441,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, sampled_token_map: dict[str, list[int]]
-    ) -> tuple[list[EngineCoreOutput], set[str]]:
+    ) -> tuple[dict[int, list[EngineCoreOutput]], dict[int, set[str]]]:
         """Per-request delivery: row disposition goes through
         _lwd_row_disposition (zero-accepted live rows are skipped; ERROR
         only when accepted>0 yet token missing); late results not in
-        awaiting are idempotently dropped."""
-        outputs: list[EngineCoreOutput] = []
-        finished: set[str] = set()
+        awaiting are idempotently dropped.
+
+        Results are grouped by ``request.client_index`` so each logical edge
+        receives only its own outputs (edge0->client 0, edge2->client 2)."""
+        outputs: dict[int, list[EngineCoreOutput]] = {}
+        finished: dict[int, set[str]] = {}
         # accepted is position-aligned with rows (same contract as
         # lwd_build_unembed_batch); the DISABLE_DOWN bypass carries no
         # accepted, so token presence/absence is used instead
@@ -486,6 +512,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 continue
+            request = self.requests[request_id]
+            client_index = getattr(request, "client_index", 0)
+            if sampled_token_ids:
+                request.append_output_token_ids(sampled_token_ids)
+                if self.lwd_on_tokens is not None:
+                    self.lwd_on_tokens(request)
+            if finished_now and self.lwd_on_finish is not None:
+                self.lwd_on_finish(request)
             if finished_now:
                 # The ground truth of the cloud's stop decision lands here:
                 # native finish settles the account (KV/cache release and
@@ -503,7 +537,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         finish_reason, RequestStatus.FINISHED_STOPPED
                     ),
                 )
-            outputs.append(
+            outputs.setdefault(client_index, []).append(
                 EngineCoreOutput(
                     request_id,
                     sampled_token_ids,
@@ -511,7 +545,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
             )
             if finished_now:
-                finished.add(request_id)
+                finished.setdefault(client_index, set()).add(request_id)
         return outputs, finished
 
     @staticmethod
@@ -580,10 +614,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return req_ids, expected, cap
 
     def _lwd_schedule_batch(self, dp_idx: LwdConnectionId) -> SchedulerOutput:
-        """Chunk batch assembly: the picker selects the batch of one
-        connection, scheduled via the base-class visible-set mechanism
-        (budget clamped to that connection's cap; the chunk split is
-        guaranteed by the clamping parameters to be reproduced natively)."""
+        """Chunk batch assembly: the picker selects the batch of one engine,
+        scheduled via the base-class visible-set mechanism (budget clamped
+        to that engine's cap; the chunk split is guaranteed by the clamping
+        parameters to be reproduced natively)."""
         req_ids, _expected, cap = self._lwd_pick_prefill_batch(dp_idx)
         return self._lwd_schedule(req_ids, token_budget_cap=cap)
 
@@ -601,7 +635,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return [], num_new_tokens, encoder_compute_budget, []
 
     def _lwd_has_prefill_chunk_inflight(self, dp_idx: LwdConnectionId) -> bool:
-        """Whether this connection has an embed request not fully sent; same
+        """Whether dp_idx has an embed request not fully sent; same
         criterion as the picker resume branch -- the two must stay
         consistent (the gate lets a resume finish before new work)."""
         return any(
@@ -626,12 +660,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     ) -> LwdConnectionId:
         """Scheduler-local half of request admission: mode boundary
         validation, mrope precomputation and routing. Returns the routed
-        connection; the cloud announcement and enqueueing belong to the
+        dp_idx; the cloud announcement and enqueueing belong to the
         engine's add_request; abort_immediately goes through the native
         engine path (the ledger is pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
-        return self._lwd_route_request(request.request_id, preferred)
+        return self._lwd_route_request(
+            request.request_id, self._lwd_edge_id_of(request), preferred
+        )
 
     def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> bool:
         hash_block_size = self._lwd_prefix_hash_block_size
@@ -716,7 +752,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self, dp_idx: LwdConnectionId, scheduler_output: SchedulerOutput
     ) -> None:
         """Send one batch RangeNotify of dp_idx and attach the EMBED batch;
-        a seqno of that connection is only taken by a notify that was sent."""
+        a seqno of that engine is only taken by a notify that was sent."""
         built = self._lwd_build_range_items(scheduler_output.num_scheduled_tokens)
         if built is None:
             return
@@ -912,7 +948,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def lwd_edge_abort(
         self, request_ids: list[str]
     ) -> list[tuple[LwdConnectionId, str]]:
-        """Settle aborted requests and return their original connections."""
+        """Settle aborted requests and return their original DP routes."""
         aborted = set(request_ids)
         self._lwd_pending_refills = deque(
             output
@@ -960,8 +996,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return
         refill_batches = {
             seqno: set(account.pending_batches[seqno])
-            for connection, seqno in getattr(self, "_lwd_announced_refills", set())
-            if connection == account.connection_id
+            for dp_idx, seqno in getattr(self, "_lwd_announced_refills", set())
+            if dp_idx == account.dp_idx
             and seqno in account.pending_batches
             and request_id in account.pending_batches[seqno]
         }

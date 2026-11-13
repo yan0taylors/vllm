@@ -67,7 +67,13 @@ class LwdParallelGroupsSpec:
         scene = topology.deployment.scene
         # 1. One allocation per edge instance (its DPs share its ranks: one
         # process serves them all) and one per cloud DP (one engine each).
-        edge_allocations = [edge.dp[0].ranks for edge in topology.edges]
+        # edge_share has several logical frontend IDs but exactly one edge
+        # engine/allocation. Only that engine joins the shared world; its
+        # attach-only API processes do not create parallel groups.
+        edge_instances = (
+            topology.edges[:1] if scene == "edge_share" else topology.edges
+        )
+        edge_allocations = [edge.dp[0].ranks for edge in edge_instances]
         cloud_allocations = [dp.ranks for cloud in topology.clouds for dp in cloud.dp]
         seen: set[int] = set()
         for allocation in (*edge_allocations, *cloud_allocations):
@@ -105,7 +111,7 @@ class LwdParallelGroupsSpec:
         # that position's rank of every DP of the instance (all DPs split
         # the instance ranks equally); edge ranks are singletons.
         dp_groups: list[LwdRankGroup] = [
-            (rank,) for edge in topology.edges for rank in edge.dp[0].ranks
+            (rank,) for edge in edge_instances for rank in edge.dp[0].ranks
         ]
         dp_groups += [
             tuple(dp.ranks[position] for dp in cloud.dp)
@@ -115,7 +121,7 @@ class LwdParallelGroupsSpec:
         # 4. EP groups: experts sharded dp x tp over each cloud instance, as
         # natively; the edge holds no experts but joins a group so every
         # rank is covered.
-        ep_groups: list[LwdRankGroup] = [edge.dp[0].ranks for edge in topology.edges]
+        ep_groups: list[LwdRankGroup] = [edge.dp[0].ranks for edge in edge_instances]
         ep_groups += [
             tuple(rank for dp in cloud.dp for rank in dp.ranks)
             for cloud in topology.clouds
