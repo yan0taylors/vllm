@@ -7,7 +7,6 @@ from typing import Any
 from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
 from .entry import LwdConfig
-from .legacy import has_legacy_lwd_args, resolve_legacy_lwd_config
 from .logging import log_lwd_config
 from .topology import LwdConnectionId, LwdTopology
 
@@ -18,8 +17,6 @@ __all__ = [
     "LwdCoordinationConfig",
     "LwdTopology",
     "log_lwd_config",
-    "has_legacy_lwd_args",
-    "resolve_legacy_lwd_config",
     "resolve_lwd_config",
 ]
 
