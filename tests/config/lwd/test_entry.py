@@ -145,7 +145,7 @@ def test_snapshot_survives_handoff_without_yaml_or_key_access(
     path.unlink()
     received = pickle.loads(pickle.dumps(snapshot))
     assert received.instance.id == 1
-    assert [link.dp_idx for link in received.connections] == [0, 1]
+    assert [link.connection_id.dp_idx for link in received.connections] == [0, 1]
     assert received.topology.digest
     assert received.coordination.consumer_id == "enterprise-a-edge1"
     assert received.coordination.connect_timeout == 5.0
@@ -292,6 +292,6 @@ def test_api_cli_metadata_survives_snapshot_handoff(
     received_entry = pickle.loads(pickle.dumps(entry))
     assert received_entry.api == api
     assert received_entry.coordination.enabled is False
-    assert [c.dp_idx for c in received_entry.connections] == [0, 1]
+    assert [c.connection_id.dp_idx for c in received_entry.connections] == [0, 1]
     assert received_entry.instance_id == identity
     assert args.additional_config == original

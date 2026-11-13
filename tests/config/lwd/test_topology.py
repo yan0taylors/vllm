@@ -43,9 +43,9 @@ def test_colocated_edges_keep_distinct_ranks_and_share_cloud(dp_count: int) -> N
     assert topology.deployment.hccl_world_size == 10
     for edge in topology.edges:
         assert {d.ranks for d in edge.dp} == {(edge.id,)}
-        assert [c.cloud_id for c in topology.connections("edge", edge.id)] == [
-            0
-        ] * dp_count
+        assert [
+            c.connection_id.cloud_id for c in topology.connections("edge", edge.id)
+        ] == [0] * dp_count
 
 
 @pytest.mark.parametrize(
@@ -210,12 +210,16 @@ def test_explicit_layout_does_not_have_to_follow_generator_defaults(
                 dp["ctrl_port"],
             )
     for connection in topology.connections("edge", 0):
-        assert connection.dp_idx == connection.edge.dp_idx == connection.cloud.dp_idx
+        assert (
+            connection.connection_id.dp_idx
+            == connection.edge.dp_idx
+            == connection.cloud.dp_idx
+        )
 
 
 def test_edge_share_uses_explicit_one_to_one_links() -> None:
     raw = topology_payload("s2_edge_share_1dp.yaml")
     raw["instance_links"] = [{"edge": 0, "cloud": 1}, {"edge": 1, "cloud": 0}]
     topology = LwdTopology.from_dict(raw)
-    assert [c.cloud_id for c in topology.connections("edge", 0)] == [1]
-    assert [c.edge_id for c in topology.connections("cloud", 0)] == [1]
+    assert [c.connection_id.cloud_id for c in topology.connections("edge", 0)] == [1]
+    assert [c.connection_id.edge_id for c in topology.connections("cloud", 0)] == [1]

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Cloud engine cores for one edge connection per DP rank.
+"""Cloud engine cores serving multiple edge connections per DP rank.
 
 Range notifies post extended early-receive hints, request notifies become
 native ADDs with prompt-length and M-RoPE metadata, and abort notifies use the
@@ -25,6 +25,7 @@ from typing import Any
 
 import torch
 
+from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine import EngineCoreRequestType
@@ -146,6 +147,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_init_prefix_cache()
         self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edge: LwdPeer | None = None
+        self._lwd_edges: set[LwdPeer] = set()
         self._lwd_prompt_lens: dict[str, int] = {}
         self._lwd_retired_prompt_lens: dict[str, int] = {}
         self._lwd_request_nonces: dict[str, int] = {}
@@ -200,10 +202,16 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_edge_to_cloud(payload)
 
+    def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
+        return LwdConnectionId(
+            peer.instance_id, self.lwd_config.instance_id, peer.dp_rank
+        )
+
     def _lwd_handle_peer_registered(self, peer: LwdPeer) -> None:
         """Engine thread: remember the edge and send it the scheduling
         limits before anything else."""
         self._lwd_edge = peer
+        self._lwd_edges.add(peer)
         self._lwd_send_until_queued(peer, self._lwd_cloud_params)
         lwd_logger.info(
             "[cloud] edge %s registered; scheduling limits sent: %s",

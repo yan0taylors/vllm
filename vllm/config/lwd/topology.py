@@ -3,7 +3,9 @@
 
 """File schema for LWD, independent of devices and distributed initialization."""
 
+import json
 from collections.abc import Hashable
+from dataclasses import asdict
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
@@ -147,13 +149,20 @@ class LwdLink:
     cloud: LwdId
 
 
-@dataclass(frozen=True)
-class LwdDPConnection:
-    """One explicit instance link expanded at matching DP indices."""
+@dataclass(frozen=True, order=True)
+class LwdConnectionId:
+    """Stable identity of one edge -> cloud DP/engine connection."""
 
     edge_id: int
     cloud_id: int
     dp_idx: int
+
+
+@dataclass(frozen=True)
+class LwdDPConnection:
+    """One explicit instance link expanded at matching DP indices."""
+
+    connection_id: LwdConnectionId
     edge: LwdDP
     cloud: LwdDP
 
@@ -171,17 +180,14 @@ class LwdTopology:
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
-    """First 16 hex characters of the source file digest; empty for from_dict."""
+    """First 16 hex characters of the canonical topology SHA-256 digest."""
 
     @classmethod
     def from_file(cls, path: str) -> "LwdTopology":
         try:
             file_bytes = Path(path).read_bytes()
             raw = yaml.load(file_bytes.decode("utf-8"), Loader=_UniqueKeyLoader)
-            topology = cls.from_dict(raw)
-            # The digest belongs to the loaded snapshot, not to YAML input.
-            object.__setattr__(topology, "digest", sha256(file_bytes).hexdigest()[:16])
-            return topology
+            return cls.from_dict(raw)
         except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
             raise ValueError(f"[LWD] Invalid topology file {path!r}: {exc}") from exc
 
@@ -189,6 +195,22 @@ class LwdTopology:
     def from_dict(cls, raw: Any) -> "LwdTopology":
         topology = TypeAdapter(cls).validate_python(raw)
         topology.validate_layout()
+        # Hash the validated semantic snapshot, never YAML spelling/layout.
+        # Exclude the derived digest field itself from the canonical payload.
+        canonical = asdict(topology)
+        canonical.pop("digest", None)
+        canonical["instance_links"] = sorted(
+            canonical["instance_links"],
+            key=lambda link: (link["edge"], link["cloud"]),
+        )
+        encoded = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        object.__setattr__(topology, "digest", sha256(encoded).hexdigest()[:16])
         return topology
 
     @field_validator("edges", "clouds")
@@ -267,21 +289,11 @@ class LwdTopology:
             )
 
     def _validate_control_ports(self) -> None:
+        # Every cloud DP binds its ctrl_port on all interfaces, so two DPs on
+        # the same address must not share a port. Ports may repeat across
+        # addresses (their namespaces are independent), which also covers
+        # edge_share clouds hosted on distinct machines.
         dps = [dp for cloud in self.clouds for dp in cloud.dp]
-        if self.deployment.scene == "edge_share":
-            # These are shared per-DP channel references, not cloud bind addresses.
-            ports: dict[int, int | None] = {}
-            for dp in dps:
-                if ports.setdefault(dp.dp_idx, dp.ctrl_port) != dp.ctrl_port:
-                    raise ValueError(
-                        "[LWD] edge_share requires the same ctrl_port for "
-                        "the same DP across all cloud instances"
-                    )
-            if len(set(ports.values())) != len(ports):
-                raise ValueError(
-                    "[LWD] edge_share requires different ctrl_port values per DP"
-                )
-            return
         if len({(dp.addr, dp.ctrl_port) for dp in dps}) != len(dps):
             raise ValueError(
                 "[LWD] Cloud DPs on the same address must use "
@@ -296,10 +308,11 @@ class LwdTopology:
             raise ValueError("[LWD] single_instance requires one edge and one cloud")
         if scene == "cloud_share" and (edge_count < 2 or cloud_count != 1):
             raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
-        if scene == "lwd_cluster" and (edge_count < 2 or cloud_count < 2):
-            raise ValueError("[LWD] lwd_cluster requires multiple edges and clouds")
-        # coordination only exists for cloud_share, embedded in each instance
-        if scene == "cloud_share":
+        if scene == "lwd_cluster" and (edge_count < 1 or cloud_count < 2):
+            raise ValueError("[LWD] lwd_cluster requires at least two clouds")
+        # Coordination may be enabled explicitly in every scene. Shared and
+        # multi-cloud scenes require it for every instance.
+        if scene in ("cloud_share", "lwd_cluster"):
             for edge in self.edges:
                 if edge.coordination is None or not edge.coordination.enabled:
                     raise ValueError(
@@ -311,13 +324,6 @@ class LwdTopology:
                     raise ValueError(
                         "[LWD] cloud_share requires each cloud instance to have "
                         "an enabled coordination block"
-                    )
-        else:
-            for instance in (*self.edges, *self.clouds):
-                if instance.coordination is not None:
-                    raise ValueError(
-                        f"[LWD] coordination is only allowed in cloud_share scene, "
-                        f"got scene={scene}"
                     )
         if scene == "edge_share":
             if edge_count != cloud_count or cloud_count < 2:
@@ -351,9 +357,7 @@ class LwdTopology:
             ):
                 result.append(
                     LwdDPConnection(
-                        link.edge,
-                        link.cloud,
-                        edge_dp.dp_idx,
+                        LwdConnectionId(link.edge, link.cloud, edge_dp.dp_idx),
                         edge_dp,
                         cloud_dp,
                     )
