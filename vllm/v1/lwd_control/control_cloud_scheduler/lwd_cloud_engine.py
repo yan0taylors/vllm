@@ -94,7 +94,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         # it would lose the whole point of pre-posting the receive.
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import create_hint_mq
 
-        self._lwd_hint_mq = create_hint_mq()
+        dp_idx = vllm_config.parallel_config.data_parallel_index
+        connections = tuple(
+            connection.connection_id
+            for connection in vllm_config.lwd_config.connections
+            if connection.connection_id.dp_idx == dp_idx
+        ) or (LwdConnectionId(0, vllm_config.lwd_config.instance_id, dp_idx),)
+        self._lwd_hint_mqs = {
+            connection: create_hint_mq(connection) for connection in connections
+        }
         super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
         # The cloud endpoint worker created its done-report MQ during
         # init_device; now that the executor is up, fetch its handle over
@@ -103,20 +111,27 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         # report a handle; anything else is a wiring error.
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
-        handles = [
-            handle
-            for handle in self.model_executor.collective_rpc(
-                "lwd_early_recv_done_handle"
+        self._lwd_done_mqs = {}
+        for connection in self._lwd_hint_mqs:
+            handles = [
+                handle
+                for handle in self.model_executor.collective_rpc(
+                    "lwd_early_recv_done_handle", args=(connection,)
+                )
+                if handle is not None
+            ]
+            if len(handles) != 1:
+                raise RuntimeError(
+                    "[LWD] early receive expects one endpoint worker reporting "
+                    f"completions for {connection}, got {len(handles)}"
+                )
+            self._lwd_done_mqs[connection] = MessageQueue.create_from_handle(
+                handles[0], 0
             )
-            if handle is not None
-        ]
-        if len(handles) != 1:
-            raise RuntimeError(
-                "[LWD] early receive expects one endpoint worker reporting "
-                f"completions, got {len(handles)}"
-            )
-        self._lwd_done_mq = MessageQueue.create_from_handle(handles[0], 0)
-        lwd_logger.info("[pre-recv] hint MQ created, done MQ attached via RPC")
+        lwd_logger.info(
+            "[pre-recv] %d hint MQ(s) created, done MQs attached via RPC",
+            len(self._lwd_hint_mqs),
+        )
 
     def _lwd_init_prefix_cache(self) -> None:
         state = init_lwd_prefix_cache(
@@ -154,9 +169,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_retired_nonces: dict[str, int] = {}
         self._lwd_retired_req_ids: set[str] = set()
         self._lwd_rejected_nonces: dict[str, int] = {}
-        self._lwd_pending_seqnos: dict[int, set[str]] = {}
+        self._lwd_pending_seqnos: dict[
+            LwdConnectionId, dict[int, set[str]]
+        ] = {}
         self._lwd_request_seqnos: dict[str, set[int]] = {}
-        self._lwd_latest_seqno = -1
+        self._lwd_latest_seqnos: dict[LwdConnectionId, int] = {}
+        self._lwd_failed_connections: set[LwdConnectionId] = set()
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits are checked by the edge. The coordinator address
         # lets the edge
@@ -323,18 +341,23 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         rpc_broadcast_mq: that one is consumed single-threaded by the
         busy_loop and gets blocked by a several-hundred-ms prefill
         forward, so the hint would no longer be "early")."""
-        hint_mq = self._lwd_hint_mq
-        if hint_mq is not None:
+        if self._lwd_hint_mqs:
             from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
                 register_hint_sender,
             )
 
-            # Blocking enqueue: once the gate is on, hints are a
-            # correctness dependency — drop one and nobody pre-posts
-            # that recv, the watermark stops advancing, and batches
-            # behind the gate are never dispatched.
-            register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint))
-            lwd_logger.info("[pre-recv] hint sender registered (PD_mix -> hint MQ)")
+            for connection, hint_mq in self._lwd_hint_mqs.items():
+                if hint_mq is None:
+                    continue
+                # Blocking enqueue: once the gate is on, hints are a
+                # correctness dependency; dropping one stalls its connection.
+                register_hint_sender(
+                    lambda hint, mq=hint_mq: mq.enqueue(hint), connection
+                )
+            lwd_logger.info(
+                "[pre-recv] hint senders registered for %d connection(s)",
+                len(self._lwd_hint_mqs),
+            )
         else:
             # PD_mix is the only scheduling mode: a missing hint MQ =
             # hints never go out and the gate never opens; this must be
@@ -369,25 +392,37 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             type(msg).__name__,
             getattr(msg, "seqno", "-"),
         )
-        # TODO(lwd): several edges per cloud DP rank need requests tracked by
-        # the peer that owns them, issue #8.
+        connection_id = self._lwd_connection_of(peer)
+        if connection_id in self._lwd_failed_connections:
+            if isinstance(msg, LwdRequestNotify):
+                from vllm.v1.engine import FinishReason
+
+                self._lwd_send_until_queued(
+                    peer,
+                    LwdC2eNotify(
+                        hidden_num_elements=0,
+                        top_id_ths=[[]],
+                        num_accepted_tokens=[0],
+                        req_ids=[msg.request_id],
+                        finish_reasons=[int(FinishReason.ERROR)],
+                    ),
+                )
+            return
         if isinstance(msg, LwdRangeNotify):
-            self._lwd_handle_range_notify(msg)
+            self._lwd_handle_range_notify(connection_id, msg)
         elif isinstance(msg, LwdRequestNotify):
             self._lwd_handle_request_notify(msg)
         elif isinstance(msg, LwdAbortNotify):
             self._lwd_handle_abort_notify(msg)
 
-    def _lwd_handle_range_notify(self, notify: LwdRangeNotify) -> None:
-        """Post each new extended hint exactly once, including mixed batches."""
+    def _lwd_handle_range_notify(
+        self, connection_id: LwdConnectionId, notify: LwdRangeNotify
+    ) -> None:
+        """Post each new extended hint exactly once, per source connection."""
         rejected = getattr(self, "_lwd_rejected_nonces", {})
         if any(
             rejected.get(item.request_id) == item.prefix_nonce for item in notify.items
         ):
-            lwd_logger.info(
-                "[cloud] ignore RangeNotify for rejected generation seqno=%d",
-                notify.seqno,
-            )
             return
         current_nonces = getattr(self, "_lwd_request_nonces", {})
         if any(
@@ -395,11 +430,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             and current_nonces[item.request_id] != item.prefix_nonce
             for item in notify.items
         ):
-            lwd_logger.warning(
-                "[cloud] ignore stale RangeNotify seqno=%d", notify.seqno
-            )
+            lwd_logger.warning("[cloud] ignore stale RangeNotify seqno=%d", notify.seqno)
             return
-        if notify.seqno <= self._lwd_latest_seqno:
+        latest = self._lwd_latest_seqnos.get(connection_id, -1)
+        if notify.seqno <= latest:
             lwd_logger.info(
                 "[cloud] ignore duplicate RangeNotify seqno=%d", notify.seqno
             )
@@ -417,7 +451,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 f"[LWD] RangeNotify seqno={notify.seqno} arrived before "
                 "RequestNotify prompt lengths were recorded"
             )
-        self._lwd_track_range(notify.seqno, request_ids)
+        self._lwd_track_range(connection_id, notify.seqno, request_ids)
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             make_recv_hint,
             post_irecv_hint,
@@ -439,16 +473,37 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         }
         if any(item.is_refill for item in items):
             hint_fields["refills"] = [item.is_refill for item in items]
-        post_irecv_hint(make_recv_hint(notify.seqno, num_tokens, 0, **hint_fields))
+        post_irecv_hint(
+            make_recv_hint(
+                notify.seqno,
+                num_tokens,
+                connection_id=connection_id,
+                **hint_fields,
+            )
+        )
 
-    def _lwd_track_range(self, seqno: int, request_ids: list[str]) -> None:
-        self._lwd_latest_seqno = seqno
-        self._lwd_pending_seqnos[seqno] = set(request_ids)
+    def _lwd_track_range(
+        self,
+        connection_id: LwdConnectionId,
+        seqno: int,
+        request_ids: list[str],
+    ) -> None:
+        self._lwd_latest_seqnos[connection_id] = seqno
+        self._lwd_pending_seqnos.setdefault(connection_id, {})[seqno] = set(
+            request_ids
+        )
         for request_id in request_ids:
             self._lwd_request_seqnos.setdefault(request_id, set()).add(seqno)
 
-    def _lwd_complete_seqno(self, seqno: int) -> None:
-        request_ids = self._lwd_pending_seqnos.pop(seqno, None)
+    def _lwd_complete_seqno(
+        self, connection_id: LwdConnectionId, seqno: int
+    ) -> None:
+        pending_by_seqno = self._lwd_pending_seqnos.get(connection_id)
+        if pending_by_seqno is None:
+            return
+        request_ids = pending_by_seqno.pop(seqno, None)
+        if not pending_by_seqno:
+            self._lwd_pending_seqnos.pop(connection_id, None)
         if request_ids is None:
             return
         for request_id in request_ids:
@@ -683,66 +738,108 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     self._lwd_retire_request(output.request_id)
 
     def _lwd_drain_irecv_completions(self) -> None:
-        """Merge done-MQ arrivals into per-request rows and UP watermarks."""
-        done_mq = getattr(self, "_lwd_done_mq", None)
-        if done_mq is None:
-            return
+        """Merge every connection's done MQ into independent watermarks."""
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             record_irecv_completions,
         )
 
-        items: list[Any] = []
-        while True:
-            try:
-                items.append(done_mq.dequeue(timeout=0))
-            except TimeoutError:
-                break
-            except Exception:
-                lwd_logger.exception("[pre-recv] done MQ drain failed")
-                break
         watermark_items: list[Any] = []
-        for item in items:
-            if isinstance(item, tuple) and len(item) == 3 and item[0] == "error":
-                self._lwd_fail(f"[LWD] worker receive error seqno={item[1]}: {item[2]}")
-                return
-            if (
-                isinstance(item, tuple)
-                and len(item) in (2, 3)
-                and item[0] == "refill_done"
-            ):
-                if len(item) == 2:
-                    self.scheduler.lwd_refill_done(str(item[1]))
-                else:
+        for connection, done_mq in self._lwd_done_mqs.items():
+            while True:
+                try:
+                    item = done_mq.dequeue(timeout=0)
+                except TimeoutError:
+                    break
+                except Exception:
+                    lwd_logger.exception(
+                        "[pre-recv] done MQ drain failed for %s", connection
+                    )
+                    break
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 3
+                    and item[0] == "refill_done"
+                ):
                     self.scheduler.lwd_refill_done(str(item[1]), int(item[2]))
-                continue
-            if (
-                isinstance(item, tuple)
-                and len(item) == 2
-                and isinstance(item[0], tuple)
-            ):
-                key, arrived = item
-                watermark_items.append(key)
-                self._lwd_note_arrived(key[1], arrived)
-            else:
-                watermark_items.append(item)
+                    continue
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 4
+                    and item[1] == "error"
+                ):
+                    if item[0] != connection:
+                        raise ValueError(
+                            f"[LWD] cross-connection early-recv error on "
+                            f"{connection}: {item!r}"
+                        )
+                    self._lwd_fail_connection(connection, item[2], item[3])
+                    continue
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and isinstance(item[0], tuple)
+                ):
+                    key, arrived = item
+                    if len(key) != 3:
+                        raise ValueError(
+                            "[LWD] early-recv completion key must be "
+                            f"(connection, channel, seqno), got {key!r}"
+                        )
+                    if key[0] != connection:
+                        raise ValueError(
+                            f"[LWD] cross-connection early-recv completion on "
+                            f"{connection}: {item!r}"
+                        )
+                    watermark_items.append(key)
+                    self._lwd_note_arrived(key[0], key[2], arrived)
+                    continue
+                raise ValueError(
+                    f"[LWD] unsupported early-recv completion item: {item!r}"
+                )
         if not watermark_items:
             return
         advanced = record_irecv_completions(watermark_items)
-        for _channel, seqno in advanced:
-            self._lwd_complete_seqno(seqno)
+        for connection, _, seqno in advanced:
+            self._lwd_complete_seqno(connection, seqno)
         lwd_logger.info(
-            "[Lwd][pre-recv] DRAIN n=%d seqnos=%s advanced=%s ts=%.3f",
+            "[Lwd][pre-recv] DRAIN n=%d advanced=%s ts=%.3f",
             len(watermark_items),
-            sorted({seqno for _channel, seqno in watermark_items}),
-            sorted({seqno for _channel, seqno in advanced}),
+            advanced,
             time.monotonic(),
         )
 
-    def _lwd_note_arrived(
-        self, seqno: int, arrived: Iterable[tuple[str, int]] | None
+    def _lwd_fail_connection(
+        self, connection: LwdConnectionId, seqno: int, error: Any
     ) -> None:
-        """Merge arrivals only for requests in this still-pending seqno."""
-        request_ids = self._lwd_pending_seqnos.get(seqno)
+        """Abort only the failed connection; other edges keep making progress."""
+        if connection in self._lwd_failed_connections:
+            return
+        self._lwd_failed_connections.add(connection)
+        lwd_logger.error(
+            "[pre-recv] connection %s failed at seqno=%s: %s",
+            connection,
+            seqno,
+            error,
+        )
+        request_ids = {
+            request_id
+            for pending in self._lwd_pending_seqnos.get(connection, {}).values()
+            for request_id in pending
+        }
+        for request_id in request_ids:
+            self._lwd_retire_request(request_id, preserve_prompt=True)
+            self.aborts_queue.put_nowait([request_id])
+            self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
+
+    def _lwd_note_arrived(
+        self,
+        connection_id: LwdConnectionId,
+        seqno: int,
+        arrived: Iterable[tuple[str, int]] | None,
+    ) -> None:
+        """Merge arrivals only for requests in this connection's pending seqno."""
+        pending = self._lwd_pending_seqnos.get(connection_id, {})
+        request_ids = pending.get(seqno)
         if not arrived or request_ids is None:
             return
         touched: list[tuple[str, int, int]] = []

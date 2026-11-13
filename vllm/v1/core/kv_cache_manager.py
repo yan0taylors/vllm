@@ -280,10 +280,9 @@ class KVCacheManager:
                   Pinned so sparse prefix-cache retention does not drop
                   the junction and defeat cross-request reuse.
         """
-        # We skip finding the prefix cache hit when prefix caching is
-        # disabled or the request is marked as skipping kv cache read
-        # (which happens when the request requires prompt logprobs
-        # or calls a pooling model with all pooling).
+        # Cache lookup was already rejected above for disabled caching and
+        # skip_reading_prefix_cache requests. LWD consumes the snapshot frozen
+        # by RequestNotify -> reserve -> READY.
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
 
@@ -322,6 +321,30 @@ class KVCacheManager:
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
+
+    def lwd_commit_allocation(self, request: Request) -> None:
+        """Settle LWD prefix snapshots after a successful admission.
+
+        Pins are released and snapshots retired: the native KV chain now owns
+        the blocks. A later preemption must reserve a fresh hit.
+        """
+        reservations = getattr(self, "lwd_prefix_reservations", None)
+        if reservations is not None:
+            reservations.release(request.request_id)
+
+    def lwd_rollback_allocation(self, request: Request) -> None:
+        """Release snapshot pins after a failed admission of a preempted request.
+
+        Only preempted requests roll back: their next readmission re-queries a
+        fresh hit, so the pin cannot wedge the pool. A first-time request keeps
+        its snapshot and pin -- the edge has already trimmed embeddings to that
+        boundary, so retrying with the same snapshot is mandatory.
+        """
+        if request.num_preemptions <= 0:
+            return
+        reservations = getattr(self, "lwd_prefix_reservations", None)
+        if reservations is not None:
+            reservations.release(request.request_id)
 
     def get_computed_blocks_for_connector(
         self, request: Request
