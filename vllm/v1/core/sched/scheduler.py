@@ -471,12 +471,11 @@ class Scheduler(SchedulerInterface):
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
         if end < prefill_end:
-            max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
-            if long_prefill_threshold > 0:
-                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
-            if aligned_end > start or block_size <= max_prefill_tokens:
+            # A sub-block chunk keeps private running state and re-aligns at
+            # the next boundary; never clamp it down to zero when the whole
+            # chunk sits inside one Mamba block (aligned_end == start).
+            if aligned_end > start:
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
@@ -1064,10 +1063,24 @@ class Scheduler(SchedulerInterface):
                             <= self.max_model_len
                         ):
                             if padded_num_tokens > request_token_budget:
-                                # Prefer to not schedule than schedule un-padded.
-                                break
-                            num_new_tokens = padded_num_tokens
-                            pad_spec_decode = True
+                                lwd_window_cap = getattr(
+                                    request, "lwd_window_cap", None
+                                )
+                                if (
+                                    lwd_window_cap is None
+                                    or lwd_window_cap >= padded_num_tokens
+                                ):
+                                    # Prefer to not schedule than schedule
+                                    # un-padded.
+                                    break
+                                # The LWD prefill window itself cannot hold
+                                # the padded size and cannot grow: fall
+                                # through un-padded (the window clamp below
+                                # keeps the raw size) instead of retrying the
+                                # same 1-row window forever.
+                            else:
+                                num_new_tokens = padded_num_tokens
+                                pad_spec_decode = True
 
                     # [Lwd] prefill token accounting debug log: routed via
                     # lwd_logger (VLLM_LWD_LOG_LEVEL, default silent) so it
@@ -1206,6 +1219,9 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    # LWD: a failed readmission releases snapshot pins so the
+                    # next step re-queries instead of wedging the block pool.
+                    self.kv_cache_manager.lwd_rollback_allocation(request)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1235,6 +1251,9 @@ class Scheduler(SchedulerInterface):
                     )
 
                 request = request_queue.pop_request()
+                # LWD: the first successful admission settles the prefix
+                # snapshot (pins released, snapshot retired).
+                self.kv_cache_manager.lwd_commit_allocation(request)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.

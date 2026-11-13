@@ -339,6 +339,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         consume send watermarks."""
         watermarks = getattr(model_runner_output, "lwd_up_send_watermarks", {})
         for dp_idx, watermark in watermarks.items():
+            if isinstance(dp_idx, int):
+                # Legacy single-cloud worker/test producers used link indices.
+                dp_idx = self._lwd_connections[dp_idx]
             self._lwd_accounts[dp_idx].note_send_watermark(watermark)
             self._lwd_announced_refills = {
                 key

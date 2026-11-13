@@ -100,6 +100,7 @@ def _prefix_scheduler(request, groups, hit: int, recv_rows: int):
     manager.coordinator.find_longest_cache_hit.return_value = (groups, hit, 0)
     manager.coordinator.single_type_managers = (SimpleNamespace(block_size=16),)
     manager.coordinator.scheduler_block_size = 16
+    manager.coordinator.cache_hit_alignment_tokens = 16
     scheduler.kv_cache_manager = manager
     scheduler.lwd_prefix_reservations = LwdPrefixReservations(manager)
     return scheduler

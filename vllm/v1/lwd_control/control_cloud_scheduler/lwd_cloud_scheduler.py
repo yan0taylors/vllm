@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -27,6 +27,7 @@ from vllm.v1.core.sched.output import (
     LwdEmbedBatch,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.scheduler import Scheduler as _NativeScheduler
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     prefix_start,
 )
@@ -77,6 +78,30 @@ class LwdCloudScheduler(LwdBaseScheduler):
     """Mix all decode requests with prefill windows whose rows have arrived."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # LWD keeps every real Mamba checkpoint until the native mapping from
+        # state blocks to prefix boundaries supports sparse retention safely.
+        if len(args) > 1:
+            kv_cache_config = args[1]
+            if kv_cache_config.prefix_cache_retention_interval is not None:
+                lwd_logger.info(
+                    "[prefix] LWD uses dense Mamba checkpoints; override "
+                    "retention_interval=%s -> None",
+                    kv_cache_config.prefix_cache_retention_interval,
+                )
+                kv_cache_config = replace(
+                    kv_cache_config, prefix_cache_retention_interval=None
+                )
+                args = (args[0], kv_cache_config, *args[2:])
+        elif kwargs["kv_cache_config"].prefix_cache_retention_interval is not None:
+            previous = kwargs["kv_cache_config"].prefix_cache_retention_interval
+            lwd_logger.info(
+                "[prefix] LWD uses dense Mamba checkpoints; override "
+                "retention_interval=%s -> None",
+                previous,
+            )
+            kwargs["kv_cache_config"] = replace(
+                kwargs["kv_cache_config"], prefix_cache_retention_interval=None
+            )
         super().__init__(*args, **kwargs)
         self.lwd_recv_rows: dict[str, int] = {}
         self._lwd_dropped: set[str] = set()
@@ -163,7 +188,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
 
         recv_rows = self.lwd_recv_rows.get(request.request_id, 0)
-        alignment = self.kv_cache_manager.coordinator.scheduler_block_size
+        # Same alignment the probe path lands hits on (compressed-state
+        # boundaries on fine-grained deployments), not the scheduling block:
+        # clamping to the latter would discard a fine hit whenever recv_rows
+        # is below one scheduler block.
+        alignment = self.kv_cache_manager.coordinator.cache_hit_alignment_tokens
         clamped_hit = min(h_prime, recv_rows // alignment * alignment)
         if clamped_hit < h_prime:
             lwd_logger.info(
@@ -380,6 +409,27 @@ class LwdCloudScheduler(LwdBaseScheduler):
             return
         self._lwd_abort_pending = []
 
+    @staticmethod
+    def _lwd_cache_tokens(request: Request) -> int:
+        """LWD cache publication covers prompt blocks only."""
+        return request.num_computed_tokens - request.num_output_placeholders
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        status_before_update = request.status
+        new_token_ids, stopped = _NativeScheduler._update_request_with_output(
+            self, request, new_token_ids
+        )
+        if not is_stale:
+            request.num_output_placeholders -= len(new_token_ids)
+            assert request.num_output_placeholders >= 0
+        if status_before_update == RequestStatus.RUNNING:
+            self.kv_cache_manager.cache_blocks(
+                request, self._lwd_cache_tokens(request)
+            )
+        return new_token_ids, stopped
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -396,11 +446,18 @@ class LwdCloudScheduler(LwdBaseScheduler):
             scheduler_output, model_runner_output
         )
         self._lwd_cleanup_arrivals(engine_core_outputs)
-        carrier = getattr(model_runner_output, "lwd_down_carrier", None)
-        if carrier is not None:
-            self._lwd_append_carrier_c2e(carrier, engine_core_outputs, nonce_snapshot)
-        elif LwdControlDiag.disable_down_enabled():
-            self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
+        carriers = getattr(model_runner_output, "lwd_down_carriers", None)
+        if carriers:
+            for carrier in carriers:
+                self._lwd_append_carrier_c2e(
+                    carrier[:4], engine_core_outputs, nonce_snapshot
+                )
+        else:
+            carrier = getattr(model_runner_output, "lwd_down_carrier", None)
+            if carrier is not None:
+                self._lwd_append_carrier_c2e(carrier, engine_core_outputs, nonce_snapshot)
+            elif LwdControlDiag.disable_down_enabled():
+                self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
         return engine_core_outputs
 
     def _lwd_cleanup_arrivals(
