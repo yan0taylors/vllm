@@ -148,6 +148,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self.scheduler.lwd_refill_sender = self._lwd_send_refill
 
     def _lwd_assemble(self) -> None:
+        self.lwd_config.validate_prefix_caching(
+            self.vllm_config.cache_config.enable_prefix_caching
+        )
         if self.vllm_config.model_config.skip_tokenizer_init:
             # StructuredOutputManager builds its tokenizer and compile
             # executor only with a tokenizer; without one the first
@@ -190,6 +193,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             prefix_alignment_tokens=self._lwd_prefix_state.alignment_tokens,
             prefix_alignment_required=self._lwd_prefix_state.alignment_required,
             prefix_use_eagle=self._lwd_prefix_state.use_eagle,
+            prefix_hash_block_size=self._lwd_hash_block_size,
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request

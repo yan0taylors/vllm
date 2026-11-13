@@ -23,7 +23,6 @@ single-cloud behaviour.
 from __future__ import annotations
 
 import copy
-import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -112,6 +111,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # Injected by the engine once every cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self.lwd_refill_abort: Callable[[str], None] | None = None
+        self.lwd_on_finish: Callable[[Request], None] | None = None
+        self.lwd_on_tokens: Callable[[Request], None] | None = None
+        self.lwd_has_pending: Callable[[], bool] | None = None
         # One account per full connection: dp_idx alone is not unique when
         # this edge connects to several clouds.
         lwd_config = self.vllm_config.lwd_config
@@ -164,6 +166,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     # ------------------------------------------------------------- routing
 
+    def lwd_update_cloud_params(self, connection_id: LwdConnectionId, params) -> None:
+        """Apply one cloud's HELLO parameters without mutating global config."""
+        account = self._lwd_accounts[connection_id]
+        account.num_speculative_tokens = max(0, params.num_speculative_tokens)
+        account.prefix_use_eagle = params.prefix_use_eagle
+        account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)
+        account.prefix_alignment_required = params.prefix_alignment_required
+
     def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
         """Routed connection of an active request; unrouted ids are a bug."""
         return self._lwd_route[request_id]
@@ -173,28 +183,31 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         (a late result racing its own finish)."""
         return self._lwd_route.get(request_id)
 
-    def _lwd_route_request(self, request_id: str) -> LwdConnectionId:
-        """Pick the target connection and pin the route; the score weighs
-        prefill 4 and decode 1, the same weights as the native DP load
-        balancer, and ties rotate from the last served connection."""
+    def _lwd_route_request(
+        self, request_id: str, preferred: LwdConnectionId | None = None
+    ) -> LwdConnectionId:
+        """Pick and pin the target connection: a healthy preferred route
+        wins when supplied, otherwise the score weighs prefill 4 and decode
+        1 (the same weights as the native DP load balancer) and ties rotate
+        from the last served connection."""
         accounts = self._lwd_accounts
-        if len(accounts) == 1:
-            connection_id = next(iter(accounts))
-            self._lwd_route[request_id] = connection_id
-            accounts[connection_id].note_prefill_admitted(request_id)
-            return connection_id
-        best = min(
-            accounts.values(),
-            key=lambda account: (
-                account.score(),
-                (
-                    self._lwd_connections.index(account.connection_id)
-                    - self._lwd_last_engine
-                    - 1
-                )
-                % len(self._lwd_connections),
-            ),
-        )
+        if preferred is not None and preferred in accounts:
+            best = accounts[preferred]
+        elif len(accounts) == 1:
+            best = next(iter(accounts.values()))
+        else:
+            best = min(
+                accounts.values(),
+                key=lambda account: (
+                    account.score(),
+                    (
+                        self._lwd_connections.index(account.connection_id)
+                        - self._lwd_last_engine
+                        - 1
+                    )
+                    % len(self._lwd_connections),
+                ),
+            )
         connection_id = best.connection_id
         self._lwd_route[request_id] = connection_id
         best.note_prefill_admitted(request_id)
@@ -225,7 +238,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """
         return (
             bool(self.unembed_notify_queue)
-            or bool(getattr(self, "_lwd_pending_refills", ()))
+            or bool(self._lwd_pending_refills)
+            or (self.lwd_has_pending is not None and self.lwd_has_pending())
             or any(self._lwd_aborted_req_ids.values())
             or any(account.pending_chunks() for account in self._lwd_accounts.values())
             or self._lwd_embed_dispatchable()
@@ -508,12 +522,24 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         code = notify.finish_reasons[index]
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
+    @staticmethod
+    def _lwd_grammar_ready(request: Request) -> bool:
+        """Keep grammar-compiling requests out of the native visible set."""
+        if request.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+            return True
+        structured = request.structured_output_request
+        return bool(structured and structured.grammar)
+
     def _lwd_pick_prefill_batch(
         self, dp_idx: LwdConnectionId
     ) -> tuple[list[str], dict[str, int], int]:
-        """Pick one connection's batch within its token budget and native
-        edge slots."""
-        cap = self.max_num_scheduled_tokens
+        """Pick routed candidates within decode debt and native edge slots."""
+        account = self._lwd_accounts[dp_idx]
+        cap = max(
+            0,
+            self.max_num_scheduled_tokens
+            - account.decode_load * account.num_speculative_tokens,
+        )
         # Native edge slots are shared across DP routes. Waiting requests
         # contribute routing load, but must not reserve slots before admission.
         free_seq = self.max_num_running_reqs - len(self.running)
@@ -544,7 +570,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             waiting,
             cap=cap,
             free_seq=free_seq,
-            chunk_unit=self._lwd_chunk_unit,
+            chunk_unit=(
+                account.prefix_alignment_tokens
+                if account.prefix_alignment_required
+                and account.prefix_alignment_tokens > 0
+                else self._lwd_chunk_unit
+            ),
         )
         return req_ids, expected, cap
 
@@ -590,7 +621,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             for seqno, request_ids in account.pending_batches.items()
         )
 
-    def lwd_admit_request(self, request: Request) -> LwdConnectionId:
+    def lwd_admit_request(
+        self, request: Request, preferred: LwdConnectionId | None = None
+    ) -> LwdConnectionId:
         """Scheduler-local half of request admission: mode boundary
         validation, mrope precomputation and routing. Returns the routed
         connection; the cloud announcement and enqueueing belong to the
@@ -598,7 +631,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         engine path (the ledger is pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
-        return self._lwd_route_request(request.request_id)
+        return self._lwd_route_request(request.request_id, preferred)
 
     def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> bool:
         hash_block_size = self._lwd_prefix_hash_block_size
@@ -658,7 +691,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         mrope_features = [
             f for f in request.mm_features if f.modality != "prompt_embeds"
         ]
-        _t_mrope = time.monotonic()
         positions, _delta = self._lwd_mrope_positions_fn(
             input_tokens=list(request.prompt_token_ids),
             mm_features=mrope_features,
@@ -742,12 +774,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return None
         start, end = notify.start_row, notify.end_row
         if not 0 <= start < end <= request.num_prompt_tokens:
-            lwd_logger.error(
-                "[edge-refill] req=%s invalid range [%d, %d)",
-                request_id,
-                start,
-                end,
-            )
             return None
         chunk_size = min(
             self._lwd_chunk_unit, self.scheduler_config.max_num_batched_tokens
