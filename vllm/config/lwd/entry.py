@@ -69,6 +69,14 @@ class LwdConfig:
                 cloud_id=identity if role == "cloud" else None,
             )
             coordination.validate_role(role)
+            unknown_clouds = set(coordination.control_url_map) - {
+                cloud.id for cloud in topology.clouds
+            }
+            if unknown_clouds:
+                raise ValueError(
+                    f"[LWD] control_url_map references unknown clouds "
+                    f"{sorted(unknown_clouds)}"
+                )
         return cls(
             path,
             role,
@@ -77,6 +85,17 @@ class LwdConfig:
             coordination,
             api=api if api is not None else LwdAPIConfig(),
         )
+
+    def validate_prefix_caching(self, enabled: bool) -> None:
+        """Require one explicit HTTP coordination path for prefix caching."""
+        if not enabled:
+            return
+        if self.coordination is None or not self.coordination.enabled:
+            raise ValueError(
+                "[LWD] prefix caching requires enabled HTTP coordination "
+                "on both edge and cloud"
+            )
+        self.coordination.validate_role(self.role)
 
     @property
     def instance(self) -> LwdInstance:

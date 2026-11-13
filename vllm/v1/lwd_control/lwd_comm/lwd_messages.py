@@ -21,7 +21,7 @@ T = TypeVar("T")
 # 4: LwdRequestNotify gained `structured_outputs`. An old cloud would drop
 # the constraint silently (msgspec skips unknown fields on decode), so mixed
 # versions fail the handshake instead of serving unstructured output.
-LWD_MESSAGE_VERSION = 4
+LWD_MESSAGE_VERSION = 5
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
@@ -89,6 +89,20 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     mrope_positions: bytes = b""
     """Contiguous int64 [3, num_prompt_tokens] M-RoPE positions of the full
     prompt; empty when unused."""
+    prefix_hit_tokens: int = 0
+    """Exact prefix boundary trimmed by the edge after its gateway probe.
+
+    Native nonce negotiation ignores this field and uses its reservation. The
+    gateway path must consume the same snapshot at this boundary (or discard a
+    stale reservation for a fail-open zero hit), never renegotiate the hit.
+    """
+    prefix_probe_succeeded: bool = False
+    """Whether a gateway probe completed and created the matching reservation.
+
+    False also covers placement-only and fail-open. Keeping this separate from
+    a zero hit preserves the HMAC manifest/finish chain of successful cache
+    misses while allowing fail-open requests to discard stale reservations.
+    """
     structured_outputs: str = ""
     """`lwd_encode_structured_outputs` wire JSON of the validated
     `StructuredOutputsParams`; empty for a plain request. The cloud rebuilds
@@ -175,6 +189,24 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     """Generation to abort; zero is the legacy form."""
 
 
+class LwdGenChainNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Edge -> cloud. Full prompt+generated hash chain; replaces prior chains."""
+
+    request_id: str
+    block_hashes: list[bytes] = []
+    block_size: int = 0
+
+
+class LwdFinishNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Edge -> cloud. Final full chain, usage counters and publish decision."""
+
+    request_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    full_block_hashes: list[bytes] = []
+    publish_cache: bool = True
+
+
 class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """Cloud -> edge. Scheduling limits both sides must agree on.
 
@@ -195,6 +227,7 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     prefix_alignment_tokens: int = 0
     prefix_alignment_required: bool = False
     prefix_use_eagle: bool = False
+    prefix_hash_block_size: int = 0
 
 
 class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -240,7 +273,13 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     """Generation of each request row, aligned with req_ids."""
 
 
-LwdEdgeToCloudMessage: TypeAlias = LwdRequestNotify | LwdRangeNotify | LwdAbortNotify
+LwdEdgeToCloudMessage: TypeAlias = (
+    LwdRequestNotify
+    | LwdRangeNotify
+    | LwdAbortNotify
+    | LwdGenChainNotify
+    | LwdFinishNotify
+)
 LwdCloudToEdgeMessage: TypeAlias = (
     LwdCloudParamsNotify | LwdC2eNotify | LwdPrefixReadyNotify | LwdRefillNotify
 )
