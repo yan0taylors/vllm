@@ -23,6 +23,7 @@ single-cloud behaviour.
 from __future__ import annotations
 
 import copy
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -162,6 +163,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_chunk_unit: int = (
             threshold if threshold > 0 else self.max_num_scheduled_tokens
         )
+        # [azy] Temporary diagnostics for the 1117 2E2C TTFT investigation:
+        # admission timestamps, one-shot event guards and step counters.
+        # Remove with the investigation.
+        self._azy_admit_ts: dict[str, float] = {}
+        self._azy_prompt_sent_logged: set[str] = set()
+        self._azy_first_token_logged: set[str] = set()
+        self._azy_steps_total = 0
+        self._azy_steps_empty = 0
+        self._azy_stats_ts = time.monotonic()
 
     # ------------------------------------------------------------- routing
 
@@ -270,15 +280,45 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_schedule_step(self) -> SchedulerOutput:
         """Dispatch refills and EMBED batches before consuming cloud results."""
         if self._lwd_pending_refills:
-            return self._lwd_dispatch_refill(self._lwd_pending_refills.popleft())
+            out = self._lwd_dispatch_refill(self._lwd_pending_refills.popleft())
+            self._lwd_azy_note_step(out)
+            return out
         LwdControlDiag.edge_step_activity(
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
         )
         out = self._lwd_schedule_embed()
-        if out is not None:
-            return out
-        return self._lwd_schedule_unembed()
+        if out is None:
+            out = self._lwd_schedule_unembed()
+        self._lwd_azy_note_step(out)
+        return out
+
+    def _lwd_azy_note_step(self, out: SchedulerOutput) -> None:
+        """[azy] Step counters plus a throttled per-account snapshot.
+
+        Empty steps (no lwd_batch, no scheduled tokens) are worker round
+        trips that produce nothing; their share quantifies idle stepping,
+        and the per-account pending_chunks shows the UP in-flight backlog.
+        """
+        self._azy_steps_total += 1
+        if out.lwd_batch is None and not out.num_scheduled_tokens:
+            self._azy_steps_empty += 1
+        now = time.monotonic()
+        if now - self._azy_stats_ts >= 5.0:
+            self._azy_stats_ts = now
+            accounts = " ".join(
+                f"{conn}:p{account.pending_chunks()}"
+                f"/pf{account.prefill_load}/d{account.decode_load}"
+                for conn, account in self._lwd_accounts.items()
+            )
+            lwd_logger.info(
+                "[LWD][azy] edge-steps total=%d empty=%d rate=%.0f%% "
+                "accounts[pending/prefill/decode]=%s",
+                self._azy_steps_total,
+                self._azy_steps_empty,
+                100.0 * self._azy_steps_empty / max(1, self._azy_steps_total),
+                accounts,
+            )
 
     def _lwd_pick_serving_engine(self) -> LwdConnectionId | None:
         """Pick the next ungated connection with routed work in stable order."""
@@ -333,8 +373,30 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         out = self._lwd_schedule_batch(dp_idx)
         if not out.num_scheduled_tokens:
             return self._lwd_schedule_abort_notice()
+        self._lwd_azy_log_prompt_sent(out)
         self.lwd_edge_notify_range(dp_idx, out)
         return out
+
+    def _lwd_azy_log_prompt_sent(self, out: SchedulerOutput) -> None:
+        """[azy] One-shot log when a dispatch carries a request's last chunk."""
+        for request_id, scheduled in out.num_scheduled_tokens.items():
+            if scheduled <= 0:
+                continue
+            request = self.requests.get(request_id)
+            if request is None or request_id in self._azy_prompt_sent_logged:
+                continue
+            # Covers both accounting orders: progress advanced optimistically
+            # during scheduling, or advanced only after execution.
+            if request.num_computed_tokens + scheduled >= request.num_prompt_tokens:
+                self._azy_prompt_sent_logged.add(request_id)
+                admitted = self._azy_admit_ts.get(request_id)
+                lwd_logger.info(
+                    "[LWD][azy] edge-prompt-sent req=%s t_since_admit=%.1fms",
+                    request_id,
+                    (time.monotonic() - admitted) * 1000
+                    if admitted is not None
+                    else -1.0,
+                )
 
     def _lwd_schedule_abort_notice(self) -> SchedulerOutput | None:
         for dp_idx, request_ids in self._lwd_aborted_req_ids.items():
@@ -511,6 +573,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             request = self.requests[request_id]
             client_index = getattr(request, "client_index", 0)
             if sampled_token_ids:
+                # [azy] One-shot first-token event on the request timeline.
+                if request_id not in self._azy_first_token_logged:
+                    self._azy_first_token_logged.add(request_id)
+                    admitted = self._azy_admit_ts.get(request_id)
+                    lwd_logger.info(
+                        "[LWD][azy] edge-first-token req=%s t_since_admit=%.1fms",
+                        request_id,
+                        (time.monotonic() - admitted) * 1000
+                        if admitted is not None
+                        else -1.0,
+                    )
                 request.append_output_token_ids(sampled_token_ids)
                 if self.lwd_on_tokens is not None:
                     self.lwd_on_tokens(request)
@@ -664,9 +737,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         engine path (the ledger is pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
-        return self._lwd_route_request(
+        self._azy_admit_ts[request.request_id] = time.monotonic()
+        connection_id = self._lwd_route_request(
             request.request_id, self._lwd_edge_id_of(request), preferred
         )
+        # [azy] Admission point on the request timeline.
+        lwd_logger.info(
+            "[LWD][azy] edge-admit req=%s prompt=%d conn=%s",
+            request.request_id,
+            request.num_prompt_tokens,
+            connection_id,
+        )
+        return connection_id
 
     def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> bool:
         hash_block_size = self._lwd_prefix_hash_block_size

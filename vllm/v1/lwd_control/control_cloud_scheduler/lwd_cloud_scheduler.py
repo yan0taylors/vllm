@@ -14,6 +14,7 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -119,6 +120,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
         self.lwd_refill_sender = None
+        # [azy] Temporary diagnostics for the 1117 2E2C TTFT investigation:
+        # per-request first-arrival time, one-shot event guards, and the
+        # prefill-gate snapshot call counter. Remove with the investigation.
+        self._azy_arrival_ts: dict[str, float] = {}
+        self._azy_first_window_logged: set[str] = set()
+        self._azy_prefill_done_logged: set[str] = set()
+        self._azy_gate_calls = 0
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
@@ -142,7 +150,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return out
 
     def _lwd_collect_decode_requests(self) -> list[str]:
-        return [
+        decode_ids = [
             request.request_id
             for request in self._lwd_reqs_in_phase(
                 LwdReqPhase.DECODE,
@@ -151,6 +159,21 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 self.skipped_waiting,
             )
         ]
+        self._lwd_azy_log_prefill_done(decode_ids)
+        return decode_ids
+
+    def _lwd_azy_log_prefill_done(self, decode_ids: list[str]) -> None:
+        """[azy] One-shot prefill-completion event per request."""
+        for request_id in decode_ids:
+            if request_id in self._azy_prefill_done_logged:
+                continue
+            self._azy_prefill_done_logged.add(request_id)
+            first = self._azy_arrival_ts.get(request_id)
+            lwd_logger.info(
+                "[LWD][azy] cloud-prefill-done req=%s t_since_first_arrival=%.1fms",
+                request_id,
+                (time.monotonic() - first) * 1000 if first is not None else -1.0,
+            )
 
     def _lwd_compute_decode_consumption(self, decode_ids: list[str]) -> int:
         """Mirror native decode guards and placeholder accounting exactly."""
@@ -225,6 +248,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_pending[request.request_id] = _LwdRefillPending(
             h_prime, prefix_nonce
         )
+        # [azy] Readmission chose a refill: the edge will resend tokens.
+        lwd_logger.info(
+            "[LWD][azy] readmission-refill req=%s h_prime=%d floor=%d nonce=%d",
+            request.request_id,
+            h_prime,
+            floor,
+            prefix_nonce,
+        )
         sender(request.request_id, h_prime, floor, prefix_nonce)
         return False
 
@@ -252,6 +283,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def _lwd_collect_prefill_windows(self, room: int) -> list[_LwdPrefillWindow]:
         windows: list[_LwdPrefillWindow] = []
+        # [azy] Candidates skipped this step for no arrival yet or partial
+        # arrival (the full-prompt gate), for the throttled snapshot below.
+        waiting_rows = 0
+        waiting_partial = 0
+        waiting_samples: list[tuple[str, int, int]] = []
         reservations = getattr(self, "lwd_prefix_reservations", None)
         prefix_enabled = getattr(self, "_lwd_prefix_enabled", False)
         requests = list(
@@ -293,12 +329,28 @@ class LwdCloudScheduler(LwdBaseScheduler):
             recv_rows = self.lwd_recv_rows.get(request_id, 0)
             arrived = recv_rows - start
             if arrived <= 0:
+                waiting_rows += 1
                 continue
             num_rows = min(arrived, room)
             if num_rows < room and recv_rows < request.num_prompt_tokens:
+                waiting_partial += 1
+                if len(waiting_samples) < 5:
+                    waiting_samples.append(
+                        (request_id, recv_rows, request.num_prompt_tokens)
+                    )
                 continue
             windows.append(_LwdPrefillWindow(request, num_rows, start))
             room -= num_rows
+        self._azy_gate_calls += 1
+        if self._azy_gate_calls % 100 == 0 and (waiting_partial or waiting_rows):
+            lwd_logger.debug(
+                "[LWD][azy] prefill-gate snapshot calls=%d waiting_rows=%d "
+                "waiting_partial=%d samples(req,recv,prompt)=%s",
+                self._azy_gate_calls,
+                waiting_rows,
+                waiting_partial,
+                waiting_samples,
+            )
         return windows
 
     def _lwd_dispatch_windows(
@@ -311,6 +363,19 @@ class LwdCloudScheduler(LwdBaseScheduler):
         request_ids = decode_ids + [window.request.request_id for window in windows]
         for window in windows:
             window.request.lwd_window_cap = window.num_rows
+            # [azy] One-shot first-prefill-window event on the request timeline.
+            request_id = window.request.request_id
+            if request_id not in self._azy_first_window_logged:
+                self._azy_first_window_logged.add(request_id)
+                first = self._azy_arrival_ts.get(request_id)
+                lwd_logger.info(
+                    "[LWD][azy] cloud-first-window req=%s start=%d rows=%d "
+                    "t_since_first_arrival=%.1fms",
+                    request_id,
+                    window.start,
+                    window.num_rows,
+                    (time.monotonic() - first) * 1000 if first is not None else -1.0,
+                )
         try:
             return self._lwd_schedule(
                 request_ids,
@@ -340,9 +405,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
                     f"decode_exact={decode_exact}"
                 )
 
-    @staticmethod
     def _lwd_warn_under_scheduled(
-        out: SchedulerOutput, windows: list[_LwdPrefillWindow]
+        self,
+        out: SchedulerOutput,
+        windows: list[_LwdPrefillWindow],
+        decode_exact: int,
     ) -> None:
         requested = sum(window.num_rows for window in windows)
         scheduled = sum(
@@ -355,6 +422,25 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 "the remainder is retried next step",
                 scheduled,
                 requested,
+            )
+            # [azy] Detail line: correlate the shortfall with decode pressure
+            # and KV occupancy to tell the likely cutting gate apart.
+            shortfalls = [
+                (
+                    window.request.request_id,
+                    out.num_scheduled_tokens.get(window.request.request_id, 0),
+                    window.num_rows,
+                )
+                for window in windows
+                if out.num_scheduled_tokens.get(window.request.request_id, 0)
+                < window.num_rows
+            ]
+            lwd_logger.info(
+                "[LWD][azy] under-scheduled detail decode_exact=%d "
+                "kv_usage=%.1f%% shortfalls(rid,sched,req)=%s",
+                decode_exact,
+                self.kv_cache_manager.block_pool.get_usage() * 100.0,
+                shortfalls[:5],
             )
 
     def _lwd_attach_mrope_positions(self, out: SchedulerOutput) -> None:
@@ -477,6 +563,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 self._lwd_refill_gate.discard(request_id)
                 self._lwd_refill_pending.pop(request_id, None)
                 self._lwd_dropped.discard(request_id)
+                # [azy] release the request-timeline diagnostics state.
+                self._azy_arrival_ts.pop(request_id, None)
+                self._azy_first_window_logged.discard(request_id)
+                self._azy_prefill_done_logged.discard(request_id)
 
     def _lwd_c2e_prefix_nonces(
         self, request_ids: list[str], nonce_snapshot: dict[str, int]

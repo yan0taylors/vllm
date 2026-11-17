@@ -159,6 +159,14 @@ class LwdBaseScheduler(AsyncScheduler):
                     preempted.append(request)
                 else:
                     rest.append(request)
+            # [azy] Native preemption means recompute and readmission on the
+            # cloud; one line per event for the 1117 TTFT investigation.
+            if preempted:
+                lwd_logger.info(
+                    "[LWD][azy] native preemption count=%d reqs=%s",
+                    len(preempted),
+                    [request.request_id for request in preempted[:8]],
+                )
             self.running, self.waiting, self.skipped_waiting = saved
             self.running += post[0]
             self.waiting.extend(rest)
@@ -208,4 +216,14 @@ class LwdBaseScheduler(AsyncScheduler):
         refill_pending = getattr(self, "_lwd_refill_pending", None)
         if refill_pending is not None:
             refill_pending.pop(request.request_id, None)
+        # [azy] release the edge-side request-timeline diagnostics state.
+        admit_ts = getattr(self, "_azy_admit_ts", None)
+        if admit_ts is not None:
+            admit_ts.pop(request.request_id, None)
+        first_token = getattr(self, "_azy_first_token_logged", None)
+        if first_token is not None:
+            first_token.discard(request.request_id)
+        prompt_sent = getattr(self, "_azy_prompt_sent_logged", None)
+        if prompt_sent is not None:
+            prompt_sent.discard(request.request_id)
         return super()._free_request(request, delay_free_blocks)

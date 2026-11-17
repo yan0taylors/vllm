@@ -927,6 +927,21 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             if rows > previous:
                 self.scheduler.lwd_recv_rows[request_id] = rows
                 touched.append((request_id, previous, rows))
+                # [azy] first-arrival stamp and one-shot full-arrival event.
+                if previous == 0:
+                    self.scheduler._azy_arrival_ts[request_id] = time.monotonic()
+                request = self.scheduler.requests.get(request_id)
+                prompt_len = request.num_prompt_tokens if request is not None else 0
+                if prompt_len and previous < prompt_len <= rows:
+                    first = self.scheduler._azy_arrival_ts.get(request_id)
+                    lwd_logger.info(
+                        "[LWD][azy] cloud-arrival-done req=%s rows=%d/%d "
+                        "t_since_first_arrival=%.1fms",
+                        request_id,
+                        rows,
+                        prompt_len,
+                        (time.monotonic() - first) * 1000 if first is not None else -1.0,
+                    )
         if touched:
             lwd_logger.info("[LWD][cloud] arrival high watermarks updated: %s", touched)
 
