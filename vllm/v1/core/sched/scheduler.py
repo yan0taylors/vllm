@@ -1231,6 +1231,25 @@ class Scheduler(SchedulerInterface):
                 if new_blocks is None:
                     # The request cannot be scheduled.
 
+                    # [azy] Admission-allocation failure probe (1117 TTFT
+                    # investigation): this break is the only silent exit
+                    # between the 'sched dbg' line (num_new already computed)
+                    # and num_scheduled_tokens -- no log, no preemption.
+                    # Throttled to 5s; remove with the investigation.
+                    now = time.monotonic()
+                    if now - getattr(self, "_lwd_azy_alloc_ts", 0.0) >= 5.0:
+                        self._lwd_azy_alloc_ts = now
+                        lwd_logger.info(
+                            "[LWD][azy] waiting alloc failed req=%s num_new=%d "
+                            "free=%d total=%d lookahead=%d step=%d",
+                            request_id,
+                            num_new_tokens,
+                            self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                            max(0, self.kv_cache_manager.block_pool.num_gpu_blocks - 1),
+                            effective_lookahead_tokens,
+                            self.current_step,
+                        )
+
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
