@@ -144,7 +144,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             out = self._lwd_schedule(decode_ids)
         if windows:
             self._lwd_verify_w2(out, windows, decode_exact)
-            self._lwd_warn_under_scheduled(out, windows)
+            self._lwd_warn_under_scheduled(out, windows, decode_exact)
         self._lwd_attach_mrope_positions(out)
         self._lwd_attach_abort_notice(out)
         return out
