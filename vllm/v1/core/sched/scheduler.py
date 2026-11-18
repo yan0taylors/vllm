@@ -867,6 +867,21 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
+                    # [azy] Seat starvation probe (1117 TTFT investigation):
+                    # a waiting prefill cannot be admitted until a running
+                    # request finishes. Throttled to 5s; remove with the
+                    # investigation.
+                    now = time.monotonic()
+                    if now - getattr(self, "_lwd_azy_seat_ts", 0.0) >= 5.0:
+                        self._lwd_azy_seat_ts = now
+                        lwd_logger.info(
+                            "[LWD][azy] waiting blocked by seats running=%d "
+                            "cap=%d waiting=%d step=%d",
+                            num_running,
+                            self.max_num_running_reqs,
+                            len(self.waiting) + len(self.skipped_waiting),
+                            self.current_step,
+                        )
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1086,8 +1101,9 @@ class Scheduler(SchedulerInterface):
                     # lwd_logger (VLLM_LWD_LOG_LEVEL, default silent) so it
                     # never pollutes the native scheduler log at INFO.
                     lwd_logger.info(
-                        "sched dbg: num_new=%s computed=%s num_tokens=%s "
+                        "sched dbg: req=%s num_new=%s computed=%s num_tokens=%s "
                         "prompt=%s status=%s",
+                        request.request_id,
                         num_new_tokens,
                         num_computed_tokens,
                         request.num_tokens,

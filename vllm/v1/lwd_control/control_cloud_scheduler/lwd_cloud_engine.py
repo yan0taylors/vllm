@@ -957,8 +957,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         block_pool = scheduler.kv_cache_manager.block_pool
         lwd_logger.debug(
             "[LWD][dbg] cloud concurrency cloud_id=%d engine=%d running=%d "
-            "waiting=%d skipped=%d total=%d step=%d | kv_cache usage=%.1f%% "
-            "free=%d total=%d",
+            "waiting=%d skipped=%d total=%d step=%d cap=%d | kv_cache "
+            "usage=%.1f%% free=%d total=%d",
             self.lwd_config.instance_id,
             self._lwd_engine_index,
             len(scheduler.running),
@@ -966,6 +966,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             len(scheduler.skipped_waiting),
             len(scheduler.requests),
             scheduler.current_step,
+            scheduler.max_num_running_reqs,
             block_pool.get_usage() * 100.0,
             block_pool.get_num_free_blocks(),
             max(0, block_pool.num_gpu_blocks - 1),
