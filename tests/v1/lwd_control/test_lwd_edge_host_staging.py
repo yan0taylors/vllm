@@ -63,28 +63,26 @@ def test_pending_up_send_keeps_empty_steps_alive_until_watermark_arrives() -> No
     assert not scheduler.has_requests()
 
 
-def test_first_token_keeps_pending_but_finish_releases_request() -> None:
+def test_pending_released_only_by_settlement_or_watermark() -> None:
     scheduler = _scheduler()
     account = scheduler._lwd_accounts[0]
-    account.note_prefill_admitted("r1")
     account.register_batch(0, {"r1"})
     scheduler._lwd_route["r1"] = 0
     scheduler.requests["r1"] = SimpleNamespace(is_finished=lambda: False)
 
     assert scheduler.lwd_edge_deliver_tokens("r1", [7], finished=False)
     assert account.pending_chunks() == 1
-    assert (account.prefill_load, account.decode_load) == (0, 1)
+    assert scheduler._lwd_route["r1"] == 0
 
     scheduler._lwd_settle_request("r1")
     assert account.pending_chunks() == 0
-    assert account.load == 0
+    assert "r1" not in scheduler._lwd_route
 
 
 def test_abort_returns_original_routes_and_queues_worker_notice() -> None:
     scheduler = _scheduler()
     for request_id, dp_idx in (("r1", 1), ("r2", 0)):
         scheduler._lwd_route[request_id] = dp_idx
-        scheduler._lwd_accounts[dp_idx].note_prefill_admitted(request_id)
 
     routed = scheduler.lwd_edge_abort(["r1", "r2", "unknown"])
 
@@ -134,9 +132,17 @@ def test_prefill_cap_does_not_reserve_inflight_spec_tokens() -> None:
     scheduler = _scheduler()
     scheduler.max_num_scheduled_tokens = 128
     scheduler.max_num_running_reqs = 16
-    scheduler._lwd_accounts[0].prefill_load = 12
+    scheduler._lwd_accounts[0].num_speculative_tokens = 3
     scheduler._lwd_chunk_unit = 128
-    scheduler.running = []
+    scheduler._lwd_route = {"r1": 0}
+    scheduler.running = [
+        SimpleNamespace(
+            request_id="r1",
+            num_computed_tokens=3,
+            num_prompt_tokens=50,
+            is_finished=lambda: False,
+        ),
+    ]
     scheduler.skipped_waiting = []
     scheduler.waiting = []
     scheduler.vllm_config = SimpleNamespace(
@@ -146,6 +152,40 @@ def test_prefill_cap_does_not_reserve_inflight_spec_tokens() -> None:
     _, _, cap = scheduler._lwd_pick_prefill_batch(0)
 
     assert cap == 128
+
+
+def test_pick_prefill_batch_cap_deducts_routed_decode_debt() -> None:
+    scheduler = _scheduler()
+    scheduler.max_num_scheduled_tokens = 128
+    scheduler.max_num_running_reqs = 16
+    scheduler._lwd_accounts[0].num_speculative_tokens = 3
+    scheduler._lwd_chunk_unit = 128
+    scheduler._lwd_route = {"r1": 0, "r2": 1}
+    scheduler.running = [
+        SimpleNamespace(
+            request_id="r1",
+            num_computed_tokens=50,
+            num_prompt_tokens=50,
+            is_finished=lambda: False,
+        ),
+        SimpleNamespace(
+            request_id="r2",
+            num_computed_tokens=60,
+            num_prompt_tokens=60,
+            is_finished=lambda: False,
+        ),
+    ]
+    scheduler.skipped_waiting = []
+    scheduler.waiting = []
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="test"))
+    )
+
+    _, _, cap = scheduler._lwd_pick_prefill_batch(0)
+
+    # Only r1 is routed to dp 0 (r2 belongs to dp 1), so the debt is one
+    # decode request's MTP share.
+    assert cap == 128 - 3
 
 
 def test_engine_sends_abort_to_original_dp(monkeypatch) -> None:

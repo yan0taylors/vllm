@@ -388,18 +388,10 @@ class _Account:
     def __init__(self, connection_id: tuple[str, int, int]) -> None:
         self.connection_id = connection_id
         self.pending_batches = {}
-        self.prefill_requests = set()
         self.dropped = []
 
     def drop_request(self, request_id: str) -> None:
-        self.prefill_requests.discard(request_id)
         self.dropped.append(request_id)
-
-    def note_request_settled(self, request_id: str, was_awaiting: bool) -> None:
-        pass
-
-    def note_prefill_done(self, request_id: str) -> None:
-        pass
 
 
 _CONNECTION = ("cloud", 0, 0)
