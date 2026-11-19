@@ -314,11 +314,10 @@ _LwdProbeTaskKey = (edge_id, request_id, probe_nonce, cloud_id, dp_idx)
 
 ```text
 1. normalized_hit_tokens 降序
-2. 现有连接 score / pending / chunk 负载，复用 Scheduler 的同一评分逻辑
-3. 有序 round-robin 打破最终平局
+2. 有序 round-robin（与边侧路由共享 `_lwd_last_engine` 锚点）
 ```
 
-**winner 选择发生在 engine thread。** probe runtime 只返回通过协议校验的候选结果；engine thread 完成命中归一化，并在同一 Scheduler 状态下执行上述排序。禁止 probe manager/runtime 跨线程读取 `LwdCloudDpAccount`，也禁止手写另一份调度负载公式。现有评分应提取为仅供 engine thread 调用的无副作用函数，或纳入 `_lwd_route_request()` 的 preferred-candidates 裁定。
+**winner 选择发生在 engine thread。** probe runtime 只返回通过协议校验的候选结果；engine thread 完成命中归一化，并在同一 Scheduler 状态下执行上述排序。禁止 probe manager/runtime 跨线程读取 `LwdCloudDpAccount`。
 
 赢家确定后，engine thread 构造目标并提交 activate；activate 的完成事件回到 engine thread 后才允许准入：
 
@@ -628,7 +627,7 @@ prefix probe HTTP 请求数从当前“选中一云后的 D 次内部命令”�
 - `lwd_edge_client.py`：短 probe API 与赢家 activate/usage API。
 - `lwd_cloud_health.py`：DP 健康。
 - `lwd_edge_engine.py`：唯一 completion、activate 后 admission、严格 DP 绑定。
-- `lwd_edge_scheduler.py`：仅提取/复用评分逻辑；连接账户与路由主体不变。
+- `lwd_edge_scheduler.py`：平手判决走有序轮询（`_lwd_route_rotation`，与路由共享锚点）；连接账户与路由主体不变。
 - `lwd_probe_runtime.py`：候选 task 并发额度、批次取消和 session 生命周期。
 
 ### 12.4 明确不改
@@ -666,7 +665,7 @@ prefix probe HTTP 请求数从当前“选中一云后的 D 次内部命令”�
 - prefix 请求确实并发覆盖全部合格候选，无提前返回。
 - 已知高命中在 dp1、低命中在 dp0 时必须选择 dp1；跨云同理。
 - 不同 alignment/block size 下比较归一化命中，赢家 chain 正确重建。
-- 命中相同时按共享负载评分，再平手轮询。
+- 命中相同时按有序轮询决胜。
 - 部分失败仍选成功候选中的最优；全部失败进入可观测的全量 prefill。
 - abort、重提、timeout、close 取消全部 task，迟到结果不 admission。
 - placement 只选一个 DP；显式 skip prefix 的请求不触发全候选 probe。
